@@ -395,11 +395,29 @@ object Hl2Protocol {
         // voltage channel", never 0 V, and must not surface as data.
         val vRaw = if (vCount > 0) voltAcc.toDouble() / vCount else 0.0
         val volts = vRaw / 4095.0 * 3.3 * ((4.7 + 0.82) / 0.82)
+        // FORWARD AND REVERSE CAN ARRIVE SWAPPED. The Hermes-Lite 2 reference
+        // does exactly this and says why in one line — hl2.cxx:1220,
+        // "forward and reverse power could be backwards" — swapping whenever
+        // reverse reads higher than forward. Measured on a real HL2 (fw 74,
+        // MAC 00:1c:c0:a2:13:dd) into a dummy load: at drive 60 the raw
+        // readings were fwd 23.2 / rev 35.6, which is physically impossible
+        // into a matched load and is the board reporting the pair the other
+        // way round.
+        //
+        // This is not cosmetic. MainActivity derives the PA's SWR protection
+        // from these two (rho = sqrt(rev/fwd)), so an un-swapped pair either
+        // invents a huge SWR on a perfectly matched load or, worse, hides a
+        // real mismatch behind a ratio below 1.
+        var fwdAvg = if (tCount > 0) fwd / tCount else 0
+        var revAvg = if (cCount > 0) rev / cCount else 0
+        if (fwdAvg < revAvg) {
+            val t = fwdAvg; fwdAvg = revAvg; revAvg = t
+        }
         return Telemetry(
             temperatureC = tempC,
             paCurrentA = paCur,
-            forwardPower = if (tCount > 0) fwd / tCount else 0,
-            reversePower = if (cCount > 0) rev / cCount else 0,
+            forwardPower = fwdAvg,
+            reversePower = revAvg,
             hasData = hasData,
             supplyVolts = volts,
             hasSupplyVolts = vCount > 0 && vRaw > 0.0,
