@@ -27,7 +27,6 @@
 package com.isaklab.libhl2sdrk
 
 import android.util.Log
-import com.isaklab.isdrdrivers.core.DspThread
 import com.isaklab.isdrdrivers.core.FFTProcessor
 import com.isaklab.isdrdrivers.core.SpectrumWorker
 import com.isaklab.isdrdrivers.core.FloatRing
@@ -92,13 +91,6 @@ class Hl2Client(
         // else. Sending HL2-extension addresses to old firmware is undefined
         // behaviour, so the rotation excludes them.
         private val C0_SEQUENCE_CLASSIC = intArrayOf(0, 2, 4, 6, 8, 10)
-
-        // Idle EP2 cadence: 3 ms while the control state is moving, 10 ms once
-        // it has been still for half a second. A full C0 rotation still
-        // completes in 100 ms at the slow rate, and nudge() leaves it at once.
-        private const val IDLE_FAST_NS = 3_000_000L
-        private const val IDLE_SLOW_NS = 10_000_000L
-        private const val CONTROL_QUIET_NS = 500_000_000L
     }
 
     /**
@@ -109,11 +101,8 @@ class Hl2Client(
     @Volatile var spectrumEnabled: Boolean = true
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    // The two hot loops own their threads (see DspThread): they only block on
-    // the socket and pace themselves, so a shared coroutine pool bought them
-    // nothing and cost a leaked priority plus a thread hop per beat.
-    private var receiveThread: Thread? = null
-    private var txSenderThread: Thread? = null
+    private var receiveJob: Job? = null
+    private var txSenderJob: Job? = null
     private var socket: DatagramSocket? = null
     private var board: InetAddress? = null
     @Volatile private var running = false
@@ -128,9 +117,6 @@ class Hl2Client(
     private val state = Hl2Protocol.ControlState().also { it.classicBoard = classicBoard }
     private var txSeq = 0L
     private var c0Index = 0
-
-    /** Last time the control state moved, for the idle EP2 cadence. */
-    @Volatile private var lastControlChangeNs = 0L
 
     // RX accumulation (delivered as display-sized blocks).
     private var lastFftTimeMs = 0L
@@ -228,15 +214,10 @@ class Hl2Client(
         scope.launch {
             running = false
             try { sendStartStop(false) } catch (_: Exception) {}
-            // Close the socket first: it is what unblocks the receive loop,
-            // which is parked in DatagramSocket.receive and cannot be
-            // interrupted out of it.
-            socket?.close()
-            DspThread.stop(receiveThread)
-            DspThread.stop(txSenderThread)
-            receiveThread = null
-            txSenderThread = null
+            receiveJob?.cancel()
+            txSenderJob?.cancel()
             spectrumWorker?.stop()
+            socket?.close()
             socket = null
             onConnectionStatusChanged(false, "Disconnected")
         }
@@ -273,15 +254,21 @@ class Hl2Client(
     // ========================================================================
 
     private fun startReceiving() {
-        // Audio priority on a thread of our own: it feeds the audio pipeline,
-        // and on a low-end phone the spectrum/waterfall rendering otherwise
-        // preempted it, delaying block delivery and popping the audio.
-        receiveThread = DspThread.start("hl2-rx", DspThread.PRIORITY_RADIO) {
+        receiveJob = scope.launch {
+            // Raise this thread to audio priority: it feeds the audio pipeline,
+            // and on a low-end phone the spectrum/waterfall rendering otherwise
+            // preempted it, delaying block delivery and popping the audio. The
+            // receive loop owns its thread (only suspends on socket.receive).
+            try {
+                android.os.Process.setThreadPriority(
+                    android.os.Process.THREAD_PRIORITY_URGENT_AUDIO
+                )
+            } catch (_: Throwable) {}
             spectrumWorker?.start()
             val buf = ByteArray(2048)
             val packet = DatagramPacket(buf, buf.size)
             var noData = 0
-            while (running) {
+            while (running && isActive) {
                 try {
                     socket!!.receive(packet)
                     noData = 0
@@ -345,11 +332,12 @@ class Hl2Client(
      * keepalive keep flowing.
      */
     private fun startTxSender() {
-        txSenderThread = DspThread.start("hl2-tx", DspThread.PRIORITY_RADIO) {
+        txSenderJob = scope.launch {
+            val floatsPerFrame = 2 * Hl2Protocol.SAMPLES_PER_SUBFRAME * 2  // 126 pairs × 2 floats
             val pairsPerFrame = 2 * Hl2Protocol.SAMPLES_PER_SUBFRAME      // samples per frame
             var txStartNs = 0L
             var framesSent = 0L
-            while (running) {
+            while (running && isActive) {
                 val transmitting = synchronized(stateLock) { state.mox }
                 if (transmitting) {
                     // Pace frames against the wall clock and send in bursts:
@@ -381,39 +369,14 @@ class Hl2Client(
                             burst++
                         }
                     }
-                    // 0.5 ms beat: fine enough to hit the ~381 fps a 126-sample
-                    // frame period needs, and it no longer goes through the
-                    // coroutine timer thread.
-                    DspThread.pace(System.nanoTime() + 500_000L)
+                    delay(1)
                 } else {
                     txStartNs = 0L
                     sendControlFrame()
-                    // IDLE CADENCE. The board only needs EP2 traffic flowing for
-                    // its keepalive and for the C0 bank rotation to carry
-                    // register writes; 333 frames/s of that while merely
-                    // LISTENING is a syscall every 3 ms for nothing. Stay fast
-                    // while the control state is actually moving (the operator
-                    // is turning the dial, a one-shot write is queued, the key
-                    // is down) and fall back to 100/s once nothing has changed
-                    // for half a second. Any setter that the operator can feel
-                    // calls nudge(), so leaving the slow cadence is immediate —
-                    // it is never the reason a control change waits.
-                    val quietNs = System.nanoTime() - lastControlChangeNs
-                    val period = if (quietNs > CONTROL_QUIET_NS) IDLE_SLOW_NS else IDLE_FAST_NS
-                    DspThread.pace(System.nanoTime() + period)
+                    delay(3)
                 }
             }
         }
-    }
-
-    /**
-     * Wake the control sender now and hold the fast cadence for a moment: an
-     * operator-visible change (dial, rate, gain, key, register write) must not
-     * wait out the idle period.
-     */
-    private fun nudge() {
-        lastControlChangeNs = System.nanoTime()
-        java.util.concurrent.locks.LockSupport.unpark(txSenderThread)
     }
 
     /**
@@ -523,7 +486,6 @@ class Hl2Client(
     fun setFrequency(hz: Long) {
         synchronized(stateLock) { state.rxFreqHz[0] = hz }
         spectrumWorker?.resetSmoothing()
-        nudge()
     }
 
     /** Set any receiver's NCO frequency (0..3), openHPSDR addr 0x02..0x05. */
@@ -531,20 +493,15 @@ class Hl2Client(
         if (index !in 0..3) return
         synchronized(stateLock) { state.rxFreqHz[index] = hz }
         if (index == 0) spectrumWorker?.resetSmoothing()
-        nudge()
     }
 
     fun setSampleRate(hz: Int) {
         synchronized(stateLock) { state.sampleRate = hz }
         updateFlushThreshold()
         spectrumWorker?.resetSmoothing()
-        nudge()
     }
 
-    fun setLnaGain(db: Int) {
-        synchronized(stateLock) { state.lnaGainDb = db.coerceIn(-12, 48) }
-        nudge()
-    }
+    fun setLnaGain(db: Int) { synchronized(stateLock) { state.lnaGainDb = db.coerceIn(-12, 48) } }
 
     /** Configure 1 or 2 hardware receivers. */
     // HL2 gateware supports up to 4 DDCs; the frame slot math (6*nRx+2,
@@ -554,7 +511,6 @@ class Hl2Client(
     /** Set receiver 2's frequency (kept for the existing command; generalized by setRxFrequency). */
     fun setFrequency2(hz: Long) {
         synchronized(stateLock) { state.rxFreqHz[1] = hz }
-        nudge()
     }
 
     /** Choose which receiver (0 or 1) drives the spectrum/waterfall and audio. */
@@ -575,10 +531,7 @@ class Hl2Client(
 
     fun setSmoothingFactor(alpha: Float) { fft?.setSmoothingFactor(alpha) }
 
-    fun setTxFrequency(hz: Long) {
-        synchronized(stateLock) { state.txFreqHz = hz }
-        nudge()
-    }
+    fun setTxFrequency(hz: Long) { synchronized(stateLock) { state.txFreqHz = hz } }
 
     // TX sequencing for a linear amp: on key-DOWN raise the amp/relay OC
     // line, wait txDelayMs (relay settle), then enable RF; on key-UP drop RF
@@ -596,7 +549,6 @@ class Hl2Client(
     }
 
     fun setPtt(on: Boolean) {
-        nudge()
         seqJob?.cancel()
         val sequenced = (ampTxDelayMs > 0 || ampHangMs > 0) &&
             synchronized(stateLock) { state.ampKeyMask != 0 }
@@ -629,10 +581,7 @@ class Hl2Client(
         }
     }
 
-    fun setTxDrive(level: Int) {
-        synchronized(stateLock) { state.txDrive = level.coerceIn(0, 255) }
-        nudge()
-    }
+    fun setTxDrive(level: Int) { synchronized(stateLock) { state.txDrive = level.coerceIn(0, 255) } }
 
     fun setPaEnabled(on: Boolean) { synchronized(stateLock) { state.paEnabled = on } }
 
@@ -647,7 +596,6 @@ class Hl2Client(
     /** Queue a raw one-shot register write (fires once, next control frame). */
     fun writeRegister(addr: Int, data: Int) {
         synchronized(stateLock) { oneShotQueue.addLast(addr to data) }
-        nudge()
     }
 
     /**
@@ -702,7 +650,6 @@ class Hl2Client(
             state.ocOutputs = mask and 0x7F
             state.ocOutputsTx = if (txMask < 0) -1 else txMask and 0x7F
         }
-        nudge()
     }
 
     fun getOpenCollectorOutputs(): Int = synchronized(stateLock) { state.ocOutputs }
