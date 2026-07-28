@@ -188,6 +188,13 @@ class Hl2Client(
     // Connection lifecycle
     // ========================================================================
 
+    /**
+     * Initializes the UDP socket, optionally discovers the board if configured for broadcast,
+     * and establishes the network streams. Starts the RX and TX background threads,
+     * allocating a 2 MiB receive buffer to mitigate frame drops during OS scheduler stalls.
+     *
+     * @return true if successfully connected and threads are running, false on failure or timeout.
+     */
     suspend fun connect(): Boolean = withContext(Dispatchers.IO) {
         try {
             onConnectionStatusChanged(false, "Discovering…")
@@ -224,6 +231,10 @@ class Hl2Client(
         }
     }
 
+    /**
+     * Sends the hardware stop sequence to the board, cleanly halts background processing
+     * threads, and shuts down the UDP socket. Thread-safe and safe to call when partially initialized.
+     */
     fun disconnect() {
         scope.launch {
             running = false
@@ -520,6 +531,11 @@ class Hl2Client(
     // Public control API (mirrors the RTL clients, plus TX)
     // ========================================================================
 
+    /**
+     * Retunes the active receiver's local oscillator. 
+     * Resets the FFT smoothing filter so the UI doesn't blur across the tune event.
+     * Triggers an immediate control frame flush via [nudge].
+     */
     fun setFrequency(hz: Long) {
         synchronized(stateLock) { state.rxFreqHz[0] = hz }
         spectrumWorker?.resetSmoothing()
@@ -534,6 +550,10 @@ class Hl2Client(
         nudge()
     }
 
+    /**
+     * Sets the baseband sample rate for all configured receivers. 
+     * Resets internal flushing boundaries and FFT smoothing to accommodate the new frame geometry.
+     */
     fun setSampleRate(hz: Int) {
         synchronized(stateLock) { state.sampleRate = hz }
         updateFlushThreshold()
@@ -541,6 +561,11 @@ class Hl2Client(
         nudge()
     }
 
+    /**
+     * Sets the LNA gain. Applies internally to the step attenuator encoding 
+     * depending on whether the board is identified as a classic protocol-1 model or a true HL2.
+     * Range: -12 to +48 dB.
+     */
     fun setLnaGain(db: Int) {
         synchronized(stateLock) { state.lnaGainDb = db.coerceIn(-12, 48) }
         nudge()

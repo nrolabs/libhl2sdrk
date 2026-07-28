@@ -169,6 +169,12 @@ object Hl2Protocol {
      * (0,2,4,6,8,10,0x16,0x3A). [pullTxSample] is called once per transmit sample slot
      * (126×) and returns packed `(i16 shl 16) or (q16 and 0xFFFF)` or `null`
      * for silence; it is only consulted while `state.mox` is set.
+     *
+     * @param seq The monotonically increasing frame sequence number.
+     * @param c0Index The current index in the C0 bank rotation.
+     * @param state The requested state configuration (frequencies, gains, filters).
+     * @param pullTxSample The callback to pull exactly one TX IQ sample.
+     * @return The 1032-byte serialized control frame ready for transmission.
      */
     fun buildControlFrame(
         seq: Long,
@@ -320,13 +326,6 @@ object Hl2Protocol {
                 buf[2] == 0x01.toByte() && buf[3] == 0x06.toByte()
 
     /**
-     * Parses a board→host RX frame for [receiverCount] receivers, calling
-     * [onSample]`(rx, i, q)` for every IQ pair of every receiver (I, Q in
-     * `[-1,1]`) and returning decoded telemetry. The sample slot is
-     * `6*receiverCount + 2` bytes (I+Q per RX, then a shared mic word).
-     * Sub-frames with a bad sync word are skipped.
-     */
-    /**
      * Per-sample sink with PRIMITIVE parameters. A plain
      * `(Int, Float, Float) -> Unit` Kotlin function type boxes all three
      * arguments on every call — at 48 kSps that churned ~140k boxes/s and the
@@ -337,6 +336,18 @@ object Hl2Protocol {
         fun onSample(rx: Int, i: Float, q: Float)
     }
 
+    /**
+     * Parses a board→host RX frame for [receiverCount] receivers, calling
+     * [onSample]`(rx, i, q)` for every IQ pair of every receiver (I, Q in
+     * `[-1,1]`) and returning decoded telemetry. The sample slot is
+     * `6*receiverCount + 2` bytes (I+Q per RX, then a shared mic word).
+     * Sub-frames with a bad sync word are skipped.
+     *
+     * @param buf The raw frame bytes from the socket.
+     * @param receiverCount The number of hardware receivers enabled (1 or 2).
+     * @param onSample Callback triggered for every decoded discrete sample.
+     * @return Extracted hardware telemetry from the parsed banks.
+     */
     fun parseRxFrame(
         buf: ByteArray,
         receiverCount: Int,
