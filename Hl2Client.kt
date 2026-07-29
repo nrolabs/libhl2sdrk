@@ -25,6 +25,10 @@
  */
 
 package com.isaklab.libhl2sdrk
+import com.isaklab.isdrdrivers.core.LnaGainCapable
+import com.isaklab.isdrdrivers.core.TxDriveCapable
+import com.isaklab.isdrdrivers.core.TransmitCapable
+import com.isaklab.isdrdrivers.core.RadioClient
 
 import android.util.Log
 import com.isaklab.isdrdrivers.core.DspThread
@@ -73,7 +77,7 @@ class Hl2Client(
      * hold other channels on classic boards).
      */
     private val classicBoard: Boolean = false,
-) {
+) : RadioClient, TransmitCapable, TxDriveCapable, LnaGainCapable {
     companion object {
         const val BROADCAST = "255.255.255.255"
         private const val TAG = "Hl2Client"
@@ -106,7 +110,7 @@ class Hl2Client(
      * spectrum array — the host has no visible spectrum consumer. Audio/IQ
      * delivery is unaffected.
      */
-    @Volatile var spectrumEnabled: Boolean = true
+    @Volatile override var spectrumEnabled: Boolean = true
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     // The two hot loops own their threads (see DspThread): they only block on
@@ -195,7 +199,7 @@ class Hl2Client(
      *
      * @return true if successfully connected and threads are running, false on failure or timeout.
      */
-    suspend fun connect(): Boolean = withContext(Dispatchers.IO) {
+    override suspend fun connect(): Boolean = withContext(Dispatchers.IO) {
         try {
             onConnectionStatusChanged(false, "Discovering…")
             board = if (host == BROADCAST) discover() else InetAddress.getByName(host)
@@ -235,7 +239,7 @@ class Hl2Client(
      * Sends the hardware stop sequence to the board, cleanly halts background processing
      * threads, and shuts down the UDP socket. Thread-safe and safe to call when partially initialized.
      */
-    fun disconnect() {
+    override fun disconnect() {
         scope.launch {
             running = false
             try { sendStartStop(false) } catch (_: Exception) {}
@@ -536,7 +540,7 @@ class Hl2Client(
      * Resets the FFT smoothing filter so the UI doesn't blur across the tune event.
      * Triggers an immediate control frame flush via [nudge].
      */
-    fun setFrequency(hz: Long) {
+    override fun setFrequency(hz: Long) {
         synchronized(stateLock) { state.rxFreqHz[0] = hz }
         spectrumWorker?.resetSmoothing()
         nudge()
@@ -554,7 +558,7 @@ class Hl2Client(
      * Sets the baseband sample rate for all configured receivers. 
      * Resets internal flushing boundaries and FFT smoothing to accommodate the new frame geometry.
      */
-    fun setSampleRate(hz: Int) {
+    override fun setSampleRate(hz: Int) {
         synchronized(stateLock) { state.sampleRate = hz }
         updateFlushThreshold()
         spectrumWorker?.resetSmoothing()
@@ -566,7 +570,7 @@ class Hl2Client(
      * depending on whether the board is identified as a classic protocol-1 model or a true HL2.
      * Range: -12 to +48 dB.
      */
-    fun setLnaGain(db: Int) {
+    override fun setLnaGain(db: Int) {
         synchronized(stateLock) { state.lnaGainDb = db.coerceIn(-12, 48) }
         nudge()
     }
@@ -600,7 +604,7 @@ class Hl2Client(
 
     fun setSmoothingFactor(alpha: Float) { fft?.setSmoothingFactor(alpha) }
 
-    fun setTxFrequency(hz: Long) {
+    override fun setTxFrequency(hz: Long) {
         synchronized(stateLock) { state.txFreqHz = hz }
         nudge()
     }
@@ -620,7 +624,7 @@ class Hl2Client(
         ampHangMs = hangMs.coerceIn(0, 1000)
     }
 
-    fun setPtt(on: Boolean) {
+    override fun setPtt(on: Boolean) {
         nudge()
         seqJob?.cancel()
         val sequenced = (ampTxDelayMs > 0 || ampHangMs > 0) &&
@@ -654,12 +658,12 @@ class Hl2Client(
         }
     }
 
-    fun setTxDrive(level: Int) {
+    override fun setTxDrive(level: Int) {
         synchronized(stateLock) { state.txDrive = level.coerceIn(0, 255) }
         nudge()
     }
 
-    fun setPaEnabled(on: Boolean) { synchronized(stateLock) { state.paEnabled = on } }
+    override fun setPaEnabled(on: Boolean) { synchronized(stateLock) { state.paEnabled = on } }
 
     /** Enable VNA (antenna-analyzer) sweep mode — addr 0x09 data bit 23. */
     fun setVnaMode(on: Boolean) { synchronized(stateLock) { state.vnaMode = on } }
@@ -732,10 +736,10 @@ class Hl2Client(
 
     fun getOpenCollectorOutputs(): Int = synchronized(stateLock) { state.ocOutputs }
 
-    fun isTransmitting(): Boolean = synchronized(stateLock) { state.mox || state.ampKeyed }
+    override fun isTransmitting(): Boolean = synchronized(stateLock) { state.mox || state.ampKeyed }
 
     /** Queue interleaved transmit IQ (`i0,q0,…` in `[-1,1]`, 48 kSps). Drop-oldest on overflow. */
-    fun submitTxIq(iq: FloatArray) {
+    override fun submitTxIq(iq: FloatArray) {
         synchronized(txLock) { txQueue.write(iq) }   // ring drops oldest itself
     }
 
