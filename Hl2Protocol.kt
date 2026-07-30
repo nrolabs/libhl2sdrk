@@ -105,8 +105,19 @@ object Hl2Protocol {
         // addr 0x11 — TX envelope PWM min/max (radio.v:283-285, EER)
         var pwmMin = 0
         var pwmMax = 1023
-        var pttHang = 4                  // addr 0x17 C3[4:0] — PTT hang time (gateware default)
-        var txLatencyMs = 10             // addr 0x17 C4[6:0] — TX buffer latency in ms
+        // addr 0x17 — TX buffer timing. The gateware powers up with hang 4 /
+        // latency 10, sized for a wired LAN; over Wi-Fi or cellular a 10 ms
+        // buffer underruns on the first late packet and the opening syllable
+        // never makes it to air. 70 ms of latency absorbs real-world network
+        // jitter and 30 counts of hang keep the key up across short gaps —
+        // the values recommended for remote HL2 operation.
+        // Both clamp on write instead of masking on encode: a request beyond
+        // the register range must saturate (256 -> 127), never wrap to a tiny
+        // buffer (256 masked to 7 bits = 0 ms) that drops the first syllable.
+        var pttHang = 30                 // addr 0x17 C3[4:0] — PTT hang time (0..31)
+            set(v) { field = v.coerceIn(0, 31) }
+        var txLatencyMs = 70             // addr 0x17 C4[6:0] — TX buffer latency in ms (0..127)
+            set(v) { field = v.coerceIn(0, 127) }
         var resetOnDisconnect = true     // addr 0x3A C4 bit 0 — free the board on link loss
         /**
          * Classic Protocol-1 board (Hermes/Angelia/Orion families) instead of

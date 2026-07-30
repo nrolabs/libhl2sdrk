@@ -27,6 +27,7 @@
 package com.isaklab.libhl2sdrk
 import com.isaklab.isdrdrivers.core.LnaGainCapable
 import com.isaklab.isdrdrivers.core.TxDriveCapable
+import com.isaklab.isdrdrivers.core.TxTimingCapable
 import com.isaklab.isdrdrivers.core.TransmitCapable
 import com.isaklab.isdrdrivers.core.RadioClient
 
@@ -77,7 +78,7 @@ class Hl2Client(
      * hold other channels on classic boards).
      */
     private val classicBoard: Boolean = false,
-) : RadioClient, TransmitCapable, TxDriveCapable, LnaGainCapable {
+) : RadioClient, TransmitCapable, TxDriveCapable, TxTimingCapable, LnaGainCapable {
     companion object {
         const val BROADCAST = "255.255.255.255"
         private const val TAG = "Hl2Client"
@@ -622,6 +623,24 @@ class Hl2Client(
         synchronized(stateLock) { state.ampKeyMask = mask and 0x7F }
         ampTxDelayMs = txDelayMs.coerceIn(0, 1000)
         ampHangMs = hangMs.coerceIn(0, 1000)
+    }
+
+    /**
+     * TX buffer timing — addr 0x17 (C4[6:0] latency ms, C3[4:0] hang). The
+     * register is part of the regular C0 rotation, so a change here reaches
+     * the board on the next 0x16/0x17 bank pass; nudge() forces the fast
+     * cadence so that happens within a rotation, not after the idle timer.
+     * Classic Protocol-1 firmware does not define addr 0x17 (its rotation
+     * excludes the HL2-extension banks), so on a classic board the values are
+     * stored but never sent.
+     */
+    override fun setTxTiming(latencyMs: Int, hangMs: Int) {
+        synchronized(stateLock) {
+            // ControlState saturates both to the register range on write.
+            state.txLatencyMs = latencyMs
+            state.pttHang = hangMs
+        }
+        nudge()
     }
 
     override fun setPtt(on: Boolean) {
