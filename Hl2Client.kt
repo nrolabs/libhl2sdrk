@@ -242,6 +242,13 @@ class Hl2Client(
      */
     override fun disconnect() {
         scope.launch {
+            // Unkey ON THE WIRE before anything closes. setPtt only flips
+            // state.mox in memory and relies on the pacer thread's next
+            // frame — but that thread observes running=false and may never
+            // emit it, leaving the board holding MOX=1 from the last frame
+            // it did receive. A few explicit frames close that window.
+            synchronized(stateLock) { state.mox = false; state.ampKeyed = false }
+            repeat(3) { runCatching { sendControlFrame() } }
             running = false
             try { sendStartStop(false) } catch (_: Exception) {}
             // Close the socket first: it is what unblocks the receive loop,
