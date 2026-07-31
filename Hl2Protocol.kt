@@ -176,6 +176,15 @@ object Hl2Protocol {
         }
 
     /**
+     * 32-bit word of the gateware I2C passthrough (i2c_bus2.v): [31:25]=0x03
+     * magic, [24]=read, [22:16]=device, [15:8]=register, [7:0]=value. Written
+     * to C&C addr 0x3C (bus 1) or 0x3D (bus 2).
+     */
+    fun i2cPassthroughWord(read: Boolean, device: Int, reg: Int, value: Int): Int =
+        (0x03 shl 25) or (if (read) 1 shl 24 else 0) or
+            ((device and 0x7F) shl 16) or ((reg and 0xFF) shl 8) or (value and 0xFF)
+
+    /**
      * Builds one 1032-byte control/transmit frame for bank pair [c0Index]
      * (0,2,4,6,8,10,0x16,0x3A). [pullTxSample] is called once per transmit sample slot
      * (126×) and returns packed `(i16 shl 16) or (q16 and 0xFFFF)` or `null`

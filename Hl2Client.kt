@@ -104,6 +104,11 @@ class Hl2Client(
         private const val IDLE_FAST_NS = 3_000_000L
         private const val IDLE_SLOW_NS = 10_000_000L
         private const val CONTROL_QUIET_NS = 500_000_000L
+        // IO board: 12 RX fcode registers on the Pico; one delta batch per
+        // 500 ms keeps I2C passthrough writes from crowding out C&C traffic
+        // (the reference cadence of the board's own protocol notes).
+        private const val IO_FCODE_SLOTS = 12
+        private const val IO_PUSH_PERIOD_NS = 500_000_000L
     }
 
     /**
@@ -223,6 +228,10 @@ class Hl2Client(
             sendStartStop(false); delay(20)
             sendStartStop(false); delay(20)
             sendStartStop(true)
+            // The IO board's registers survive between sessions: schedule the
+            // reset-then-full-mirror so this connection never inherits stale
+            // frequencies from a previous one.
+            synchronized(ioLock) { if (ioEnabled) ioNeedsReset = true }
             running = true
             onConnectionStatusChanged(true, "Connected")
             startReceiving()
@@ -374,6 +383,9 @@ class Hl2Client(
             var framesSent = 0L
             while (running) {
                 val transmitting = synchronized(stateLock) { state.mox }
+                // Both branches: a retune while keyed (split, RIT) must reach
+                // the IO board too, or an auto-tracking amp keys the old band.
+                maybePushIoBoard()
                 if (transmitting) {
                     // Pace frames against the wall clock and send in bursts:
                     // one frame per delay(1) wake-up cannot reach the ~381 fps
@@ -711,13 +723,104 @@ class Hl2Client(
      * [7:0]=value. External tuners/filter boards hang off these buses.
      */
     fun i2cWrite(bus2: Boolean, device: Int, reg: Int, value: Int) {
-        val word = (0x03 shl 25) or ((device and 0x7F) shl 16) or
-            ((reg and 0xFF) shl 8) or (value and 0xFF)
+        val word = Hl2Protocol.i2cPassthroughWord(read = false, device = device, reg = reg, value = value)
         writeRegister(if (bus2) 0x3D else 0x3C, word)
     }
 
     /** PureSignal TX-feedback routing — addr 0x0A data[22]. */
     fun setPureSignal(on: Boolean) { synchronized(stateLock) { state.pureSignal = on } }
+
+    // ========================================================================
+    // N2ADR IO board (Pico I2C slave 0x1D on bus 2)
+    // ========================================================================
+
+    private val ioLock = Any()
+    private var ioEnabled = false
+    private var ioRfInput = 0            // REG_RF_INPUTS: 0 = internal, 1 = J9, 2 = J9 RX / J10 TX
+    private var ioOpMode = -1            // REG_OP_MODE (Thetis mode codes), −1 = not yet known
+    private var ioNeedsReset = false     // write REG_CONTROL=1 before the next push
+    private var ioSentTxFreq = -1L
+    private val ioSentFcodes = IntArray(IO_FCODE_SLOTS) { -1 }
+    private var ioSentOpMode = -1
+    private var ioSentRfInput = -1
+    private var ioLastPushNs = 0L
+
+    /**
+     * Enable the IO-board protocol: the board's Pico firmware selects PA
+     * filters / band outputs from the frequencies the HOST writes into its
+     * registers — it never looks at the OC pins. While enabled the client
+     * mirrors its own tune state into the board (TX frequency in regs 0–4
+     * with the LSB write as commit trigger, per-receiver frequency codes in
+     * regs 13–24, operating mode in reg 32), throttled to one batch per
+     * 500 ms so the I2C passthrough never crowds out C&C traffic. [opMode]
+     * uses the Thetis mode codes (0=LSB 1=USB … 9=DIGL); [rfInput] is the
+     * REG_RF_INPUTS user setting for the external RX jack.
+     */
+    fun setIoBoard(enabled: Boolean, rfInput: Int, opMode: Int) {
+        synchronized(ioLock) {
+            if (enabled && !ioEnabled) ioNeedsReset = true
+            ioEnabled = enabled
+            ioRfInput = rfInput.coerceIn(0, 2)
+            ioOpMode = opMode
+        }
+        nudge()
+    }
+
+    /**
+     * Mirror tune state into the IO board when it drifted from what was last
+     * written. Registers are static on the Pico, so only deltas go out; the
+     * TX-frequency LSB (reg 4) is always rewritten on a change because its
+     * write is what latches the new value in the firmware's IRQ handler.
+     */
+    private fun maybePushIoBoard() {
+        val now = System.nanoTime()
+        val writes = ArrayList<Pair<Int, Int>>(8)
+        synchronized(ioLock) {
+            if (!ioEnabled || now - ioLastPushNs < IO_PUSH_PERIOD_NS) return
+            if (ioNeedsReset) {
+                // Power-up registers may hold a previous session's data.
+                writes.add(IoBoard.REG_CONTROL to 1)
+                ioSentTxFreq = -1L
+                ioSentFcodes.fill(-1)
+                ioSentOpMode = -1
+                ioSentRfInput = -1
+                ioNeedsReset = false
+            }
+            val (txHz, fcodes) = synchronized(stateLock) {
+                val codes = IntArray(IO_FCODE_SLOTS) { rx ->
+                    if (rx < state.receiverCount) IoBoard.fcode(state.rxFreqHz[rx]) else 0
+                }
+                state.txFreqHz to codes
+            }
+            if (txHz != ioSentTxFreq) {
+                for (b in 4 downTo 1) {
+                    val v = ((txHz shr (8 * b)) and 0xFF).toInt()
+                    if (ioSentTxFreq < 0 || v != ((ioSentTxFreq shr (8 * b)) and 0xFF).toInt()) {
+                        writes.add((IoBoard.REG_TX_FREQ_BYTE4 + (4 - b)) to v)
+                    }
+                }
+                writes.add(IoBoard.REG_TX_FREQ_BYTE0 to (txHz and 0xFF).toInt())
+                ioSentTxFreq = txHz
+            }
+            for (rx in 0 until IO_FCODE_SLOTS) {
+                if (fcodes[rx] != ioSentFcodes[rx]) {
+                    writes.add((IoBoard.REG_FCODE_RX1 + rx) to fcodes[rx])
+                    ioSentFcodes[rx] = fcodes[rx]
+                }
+            }
+            if (ioRfInput != ioSentRfInput) {
+                writes.add(IoBoard.REG_RF_INPUTS to ioRfInput)
+                ioSentRfInput = ioRfInput
+            }
+            if (ioOpMode >= 0 && ioOpMode != ioSentOpMode) {
+                writes.add(IoBoard.REG_OP_MODE to ioOpMode)
+                ioSentOpMode = ioOpMode
+            }
+            if (writes.isEmpty()) return
+            ioLastPushNs = now
+        }
+        for ((reg, value) in writes) i2cWrite(bus2 = true, device = IoBoard.ADDRESS, reg = reg, value = value)
+    }
 
     /**
      * Gateware iambic keyer (addr 0x0B/0x0F/0x10): hardware-timed dits/dahs
