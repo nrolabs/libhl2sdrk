@@ -139,6 +139,9 @@ class Hl2Client(
     private var txSeq = 0L
     private var c0Index = 0
 
+    /** One-shot latch so the teardown in [cleanup] runs exactly once per session. */
+    private val cleanupDone = java.util.concurrent.atomic.AtomicBoolean(false)
+
     /** Last time the control state moved, for the idle EP2 cadence. */
     @Volatile private var lastControlChangeNs = 0L
 
@@ -232,6 +235,7 @@ class Hl2Client(
             // reset-then-full-mirror so this connection never inherits stale
             // frequencies from a previous one.
             synchronized(ioLock) { if (ioEnabled) ioNeedsReset = true }
+            cleanupDone.set(false)   // re-arm teardown for the new session
             running = true
             onConnectionStatusChanged(true, "Connected")
             startReceiving()
@@ -256,22 +260,43 @@ class Hl2Client(
             // frame — but that thread observes running=false and may never
             // emit it, leaving the board holding MOX=1 from the last frame
             // it did receive. A few explicit frames close that window.
+            // (sendControlFrame serializes txSeq AND the C0 rotation under
+            // stateLock, so these frames interleave safely with the still
+            // running hl2-tx pacer thread.)
             synchronized(stateLock) { state.mox = false; state.ampKeyed = false }
             repeat(3) { runCatching { sendControlFrame() } }
-            running = false
-            try { sendStartStop(false) } catch (_: Exception) {}
-            // Close the socket first: it is what unblocks the receive loop,
-            // which is parked in DatagramSocket.receive and cannot be
-            // interrupted out of it.
-            socket?.close()
-            DspThread.stop(receiveThread)
-            DspThread.stop(txSenderThread)
-            receiveThread = null
-            txSenderThread = null
-            spectrumWorker?.stop()
-            socket = null
-            onConnectionStatusChanged(false, "Disconnected")
+            cleanup("Disconnected")
         }
+    }
+
+    /**
+     * Full session teardown, shared by [disconnect] and the receive loop's
+     * timeout/error exits. Idempotent: whichever path gets here first does the
+     * work, later callers return at once. Without this the failure paths only
+     * cleared `running` — the UDP socket stayed open and the spectrum worker
+     * thread stayed alive until the next connect.
+     *
+     * Safe to call from the receive thread itself (a thread never joins on
+     * itself). The client [scope] is left alive on purpose: it owns no
+     * threads (Dispatchers.IO) and connect() may be called again.
+     */
+    private fun cleanup(statusMessage: String) {
+        if (!cleanupDone.compareAndSet(false, true)) return
+        running = false
+        seqJob?.cancel()
+        try { sendStartStop(false) } catch (_: Exception) {}
+        // Close the socket first: it is what unblocks the receive loop,
+        // which is parked in DatagramSocket.receive and cannot be
+        // interrupted out of it.
+        socket?.close()
+        val self = Thread.currentThread()
+        receiveThread?.takeIf { it !== self }?.let { DspThread.stop(it) }
+        txSenderThread?.takeIf { it !== self }?.let { DspThread.stop(it) }
+        receiveThread = null
+        txSenderThread = null
+        spectrumWorker?.stop()
+        socket = null
+        onConnectionStatusChanged(false, statusMessage)
     }
 
     private fun discover(): InetAddress? {
@@ -351,15 +376,16 @@ class Hl2Client(
                     if (++noData > 5) {
                         try { sendStartStop(true) } catch (_: Exception) {}
                         if (noData > 15) {
-                            onConnectionStatusChanged(false, "Timeout")
-                            running = false
+                            // Full teardown, not just running=false: leaving
+                            // the socket open and the spectrum worker running
+                            // held resources until the next connect.
+                            cleanup("Timeout")
                         }
                     }
                 } catch (e: Exception) {
                     if (running) {
                         Log.e(TAG, "rx error: ${e.message}")
-                        onConnectionStatusChanged(false, "Error")
-                        running = false
+                        cleanup("Error")
                     }
                 }
             }
@@ -545,9 +571,14 @@ class Hl2Client(
                 val (a, d) = oneShotQueue.removeFirst()
                 state.oneShotAddr = a; state.oneShotData = d
             }
-            Hl2Protocol.buildControlFrame(txSeq++, sequence[c0Index % sequence.size], state, txPull)
+            // C0 rotation advances under stateLock, like txSeq: disconnect()
+            // emits its unkey frames from a coroutine while the hl2-tx pacer
+            // is still running, and an unlocked read-increment could skip or
+            // duplicate a bank exactly on the unkey.
+            val f = Hl2Protocol.buildControlFrame(txSeq++, sequence[c0Index % sequence.size], state, txPull)
+            c0Index = (c0Index + 1) % sequence.size
+            f
         }
-        c0Index = (c0Index + 1) % sequence.size
         s.send(DatagramPacket(frame, frame.size))
     }
 
