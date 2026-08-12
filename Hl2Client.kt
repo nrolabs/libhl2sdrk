@@ -121,6 +121,15 @@ class Hl2Client(
      */
     @Volatile override var spectrumEnabled: Boolean = true
 
+    /**
+     * Narrow the panadapter's span before the transform; returns the
+     * decimation actually in force. With no session there is nothing to hold
+     * it, and the answer is an honest 1 rather than the request echoed back.
+     */
+    fun setSpectrumZoom(decimation: Int, offsetHz: Long): Int =
+        sessionRef.get()?.spectrum?.setZoom(decimation, offsetHz.toDouble(), getSampleRate()) ?: 1
+
+
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var board: InetAddress? = null
 
