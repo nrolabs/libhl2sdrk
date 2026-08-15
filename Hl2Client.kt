@@ -888,6 +888,10 @@ class Hl2Client(
 
     fun getSampleRate(): Double = synchronized(stateLock) { state.sampleRate.toDouble() }
 
+    override fun frequencyHz(): Long = synchronized(stateLock) { state.rxFreqHz[0] }
+
+    override fun sampleRateHz(): Int = synchronized(stateLock) { state.sampleRate }
+
     fun setSmoothingFactor(alpha: Float) {
         smoothingFactor = alpha                       // survives a reconnect
         sessionRef.get()?.fft?.setSmoothingFactor(alpha)
