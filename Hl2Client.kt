@@ -841,7 +841,14 @@ class Hl2Client(
      * Resets internal flushing boundaries and FFT smoothing to accommodate the new frame geometry.
      */
     override fun setSampleRate(hz: Int) {
-        synchronized(stateLock) { state.sampleRate = hz }
+        // The board runs exactly four speeds; an off-ladder request would be
+        // encoded as speed 0 (48 kHz) on the wire while this client kept —
+        // and announced, via sampleRateHz() — the asked-for number, putting
+        // every frequency the app derives from the rate off by that ratio.
+        // Snap to the nearest ladder entry and hold THAT as the truth.
+        val ladder = Hl2Protocol.RATE_TO_SPEED.keys
+        val actual = ladder.minByOrNull { kotlin.math.abs(it - hz) } ?: 48000
+        synchronized(stateLock) { state.sampleRate = actual }
         updateFlushThreshold()
         sessionRef.get()?.spectrum?.resetSmoothing()
         nudge()
