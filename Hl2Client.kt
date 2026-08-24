@@ -40,7 +40,6 @@ import com.isaklab.isdrdrivers.core.SeqTracker
 import kotlinx.coroutines.*
 import java.net.DatagramPacket
 import java.net.DatagramSocket
-import java.net.InetAddress
 import java.net.SocketTimeoutException
 
 /**
@@ -71,13 +70,10 @@ class Hl2Client(
     private val onTelemetry: ((Hl2Protocol.Telemetry) -> Unit)? = null,
     /** Board UDP port — override only if the firmware default (1024) was changed. */
     private val port: Int = Hl2Protocol.PORT,
-    /**
-     * Classic Protocol-1 board (Hermes/Angelia/Orion families): switches the
-     * codec to the classic attenuator encoding, suppresses HL2-only C2 bits,
-     * and drops the temperature/current telemetry claims (those AIN slots
-     * hold other channels on classic boards).
-     */
-    private val classicBoard: Boolean = false,
+    /** Exact product/wire profile; its expected board family is verified by discovery. */
+    private val profile: Protocol1Profile = Protocol1Profile.HERMES_LITE_2,
+    /** Optional read-only preflight performed by DriverSession before replacing an open radio. */
+    private val verifiedBoard: VerifiedProtocol1Board? = null,
 ) : RadioClient, TransmitCapable, TxDriveCapable, TxTimingCapable, LnaGainCapable {
     companion object {
         const val BROADCAST = "255.255.255.255"
@@ -96,7 +92,11 @@ class Hl2Client(
         // the reference clients (hl2.cxx, PowerSDR) rotate 0..10 and nothing
         // else. Sending HL2-extension addresses to old firmware is undefined
         // behaviour, so the rotation excludes them.
-        private val C0_SEQUENCE_CLASSIC = intArrayOf(0, 2, 4, 6, 8, 10)
+        // Classic addr0x0E owns the typed RX->ADC router. Keep route first,
+        // then the paired RX1/RX2 NCO bank, and advertise topology/sync last.
+        // Enabling diversity resets the cursor under [sendLock] and emits
+        // exactly this prefix before returning APPLIED to DriverSession.
+        private val C0_SEQUENCE_CLASSIC = intArrayOf(0x0E, 2, 0, 4, 6, 8, 10)
 
         // Idle EP2 cadence: 3 ms while the control state is moving, 10 ms once
         // it has been still for half a second. A full C0 rotation still
@@ -113,6 +113,8 @@ class Hl2Client(
         // write once the control sender has stopped (one register per frame).
         private const val IO_NEUTRAL_FLUSH_FRAMES = 16
     }
+
+    private val usesClassicCodec = profile.usesClassicCodec
 
     /**
      * When false, RX blocks skip the FFT and are delivered with an empty
@@ -131,8 +133,6 @@ class Hl2Client(
 
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var board: InetAddress? = null
-
     /**
      * One connection generation: the socket, the two loop threads, the
      * spectrum path and the EP2 frame counter that belong to it.
@@ -217,7 +217,10 @@ class Hl2Client(
     private val sessionRef = java.util.concurrent.atomic.AtomicReference<Session?>(null)
 
     private val stateLock = Any()
-    private val state = Hl2Protocol.ControlState().also { it.classicBoard = classicBoard }
+    private val state = Hl2Protocol.ControlState().also {
+        it.usesClassicCodec = usesClassicCodec
+        it.classicPhysicalAdcCount = if (usesClassicCodec) profile.physicalAdcCount else 0
+    }
 
     /** Spectrum smoothing chosen by the host; re-applied to each session's
      *  FFT so a reconnect does not silently fall back to the default. */
@@ -288,15 +291,24 @@ class Hl2Client(
      */
     override suspend fun connect(): Boolean = withContext(Dispatchers.IO) {
         try {
-            onConnectionStatusChanged(false, "Discovering…")
-            board = if (host == BROADCAST) discover() else InetAddress.getByName(host)
-            if (board == null) {
-                onConnectionStatusChanged(false, "No Hermes-Lite 2 found")
+            onConnectionStatusChanged(false, "Discovering ${profile.displayName}…")
+            require(verifiedBoard == null || verifiedBoard.profile == profile) {
+                "verified discovery token is for ${verifiedBoard?.profile}, requested $profile"
+            }
+            // Even an explicit IP must answer discovery with the expected
+            // board-family id. Resolving an address is not proof that the
+            // selected ANAN/HL2 is the device listening there.
+            val verified = verifiedBoard ?: Protocol1Discovery.find(profile, host, port)
+            if (verified == null) {
+                onConnectionStatusChanged(
+                    false,
+                    "No ${profile.displayName} with board id ${profile.discoveryBoardId} found",
+                )
                 return@withContext false
             }
             val sock = DatagramSocket()
             sock.soTimeout = 1000
-            sock.connect(board, port)
+            sock.connect(verified.address, port)
             // 1032-byte frames every ~2.6 ms: the platform default socket
             // buffer rides through only ~100 ms of GC/scheduler stall. Ask
             // for 2 MiB (kernel may clamp).
@@ -363,6 +375,10 @@ class Hl2Client(
             onConnectionStatusChanged(false, "Disconnected")
             return
         }
+        // Close the control admission gate synchronously. Teardown owns the
+        // slower wire/thread cleanup, but a command issued after disconnect()
+        // must never race through the still-published session.
+        s.running = false
         scope.launch { cleanup(s, "Disconnected") }
     }
 
@@ -396,7 +412,6 @@ class Hl2Client(
         // stale teardown the wire work is skipped and only this session's own
         // resources are released.
         if (sessionRef.get() === s) {
-            seqJob?.cancel()
             // Unkey ON THE WIRE, socket still open and pacer already stopped.
             // setPtt only flips state.mox in memory and relies on the pacer's
             // next frame; on any exit the pacer may never emit it, leaving
@@ -456,32 +471,6 @@ class Hl2Client(
         if (sessionRef.compareAndSet(s, null)) onConnectionStatusChanged(false, statusMessage)
     }
 
-    private fun discover(): InetAddress? {
-        val ds = DatagramSocket()
-        try {
-            ds.broadcast = true
-            ds.soTimeout = 500
-            val req = Hl2Protocol.discoveryRequest()
-            val dst = InetAddress.getByName(BROADCAST)
-            val reply = ByteArray(64)
-            repeat(4) {
-                ds.send(DatagramPacket(req, req.size, dst, port))
-                try {
-                    val p = DatagramPacket(reply, reply.size)
-                    ds.receive(p)
-                    if (Hl2Protocol.isDiscoveryReply(reply, p.length)) {
-                        Log.i(TAG, "found HL2 board_id=0x%02x at %s"
-                            .format(Hl2Protocol.boardIdOf(reply), p.address.hostAddress))
-                        return p.address
-                    }
-                } catch (_: SocketTimeoutException) { /* retry */ }
-            }
-        } finally {
-            ds.close()
-        }
-        return null
-    }
-
     // ========================================================================
     // RX
     // ========================================================================
@@ -521,7 +510,7 @@ class Hl2Client(
                         // Classic boards put exciter power / another AIN in
                         // the HL2's temperature/current slots — never claim
                         // those channels for them (fwd/rev/volts stay valid).
-                        if (classicBoard) telem = telem.copy(
+                        if (usesClassicCodec) telem = telem.copy(
                             hasTemperature = false, hasCurrent = false,
                         )
                         if (s.accumPairs >= flushPairs) flushRx(s)
@@ -661,6 +650,21 @@ class Hl2Client(
         java.util.concurrent.locks.LockSupport.unpark(sessionRef.get()?.txSenderThread)
     }
 
+    /** A retained client object is not an active terminal control session. */
+    private fun requireControlSession(): Session {
+        val s = sessionRef.get()
+            ?: throw IllegalStateException("Protocol-1 control sender is not running")
+        check(s.running && !s.socket.isClosed) {
+            "Protocol-1 control sender is not running"
+        }
+        return s
+    }
+
+    /** A failed UDP transaction leaves hardware state unknowable; retire it visibly. */
+    private fun retireAfterControlFailure(s: Session, operation: String) {
+        scope.launch { cleanup(s, "$operation failed; Protocol-1 session retired") }
+    }
+
     /**
      * Insert [pairsPerRx] zero IQ pairs (capped at one display block) into
      * the active accumulator — and every armed per-receiver stream, so the
@@ -796,7 +800,7 @@ class Hl2Client(
     }
 
     private fun sendControlFrame(s: Session) {
-        val sequence = if (classicBoard) C0_SEQUENCE_CLASSIC else C0_SEQUENCE
+        val sequence = if (usesClassicCodec) C0_SEQUENCE_CLASSIC else C0_SEQUENCE
         synchronized(sendLock) {
             val frame = synchronized(stateLock) {
                 if (state.oneShotAddr < 0 && oneShotQueue.isNotEmpty()) {
@@ -813,27 +817,104 @@ class Hl2Client(
         }
     }
 
+    /**
+     * Emit one exact C0 bank while [sendLock] is held by a semantic topology
+     * transaction. Unlike the ordinary round-robin sender this deliberately
+     * does not consume an unrelated one-shot register queued by the IO board.
+     */
+    private fun sendExactControlBankLocked(s: Session, c0: Int) {
+        val frame = synchronized(stateLock) {
+            check(state.oneShotAddr < 0) {
+                "a one-shot register was already active during a receiver route transaction"
+            }
+            Hl2Protocol.buildControlFrame(s.txSeq++, c0, state, txPull)
+        }
+        s.socket.send(DatagramPacket(frame, frame.size))
+    }
+
+    /**
+     * Apply one semantic state change and synchronously put its exact C0 bank
+     * on the wire before returning. A failed write restores the in-memory
+     * value and retires the now-indeterminate UDP session; callers therefore
+     * cannot turn a local mutation into a false terminal success.
+     */
+    private fun <T> applyExactControlState(
+        s: Session,
+        c0: Int,
+        operation: String,
+        mutate: (Hl2Protocol.ControlState) -> T,
+        rollback: (Hl2Protocol.ControlState, T) -> Unit,
+    ) {
+        synchronized(sendLock) {
+            check(sessionRef.get() === s && s.running && !s.socket.isClosed) {
+                "Protocol-1 control sender is not running"
+            }
+            val previous = synchronized(stateLock) { mutate(state) }
+            try {
+                sendExactControlBankLocked(s, c0)
+            } catch (failure: Exception) {
+                synchronized(stateLock) { rollback(state, previous) }
+                retireAfterControlFailure(s, operation)
+                throw failure
+            }
+        }
+        lastControlChangeNs = System.nanoTime()
+    }
+
+    private fun <T> applyExactControlState(
+        c0: Int,
+        operation: String,
+        mutate: (Hl2Protocol.ControlState) -> T,
+        rollback: (Hl2Protocol.ControlState, T) -> Unit,
+    ) {
+        applyExactControlState(requireControlSession(), c0, operation, mutate, rollback)
+    }
+
     // ========================================================================
     // Public control API (mirrors the RTL clients, plus TX)
     // ========================================================================
 
     /**
-     * Retunes the active receiver's local oscillator. 
-     * Resets the FFT smoothing filter so the UI doesn't blur across the tune event.
-     * Triggers an immediate control frame flush via [nudge].
+     * Retunes the primary receiver's local oscillator through the same exact,
+     * terminal bank write used by every indexed DDC tune.
      */
     override fun setFrequency(hz: Long) {
-        synchronized(stateLock) { state.rxFreqHz[0] = hz }
-        sessionRef.get()?.spectrum?.resetSmoothing()
-        nudge()
+        setRxFrequency(0, hz)
     }
 
     /** Set any receiver's NCO frequency (0..3), openHPSDR addr 0x02..0x05. */
     fun setRxFrequency(index: Int, hz: Long) {
-        if (index !in 0..3) return
-        synchronized(stateLock) { state.rxFreqHz[index] = hz }
-        if (index == 0) sessionRef.get()?.spectrum?.resetSmoothing()
-        nudge()
+        val count = synchronized(stateLock) { state.receiverCount }
+        require(index in 0 until count) {
+            "receiver $index is outside configured count $count"
+        }
+        require(hz in 10_000L..(if (usesClassicCodec) 61_400_000L else 38_400_000L)) {
+            "RX frequency $hz Hz is outside this board's exact tuning range"
+        }
+        val s = requireControlSession()
+        synchronized(sendLock) {
+            check(sessionRef.get() === s && s.running && !s.socket.isClosed) {
+                "Protocol-1 control sender is not running"
+            }
+            val previous = synchronized(stateLock) { state.rxFreqHz.copyOf() }
+            synchronized(stateLock) {
+                if (state.diversityMode == DiversityMode.RX1_RX2 && index < 2) {
+                    state.rxFreqHz[0] = hz
+                    state.rxFreqHz[1] = hz
+                } else {
+                    state.rxFreqHz[index] = hz
+                }
+            }
+            try {
+                sendExactControlBankLocked(s, if (index < 2) 2 else 4)
+            } catch (failure: Exception) {
+                synchronized(stateLock) { previous.copyInto(state.rxFreqHz) }
+                retireAfterControlFailure(s, "receiver-frequency transaction")
+                throw failure
+            }
+        }
+        if (index == 0) s.spectrum.resetSmoothing()
+        lastControlChangeNs = System.nanoTime()
     }
 
     /**
@@ -841,17 +922,25 @@ class Hl2Client(
      * Resets internal flushing boundaries and FFT smoothing to accommodate the new frame geometry.
      */
     override fun setSampleRate(hz: Int) {
-        // The board runs exactly four speeds; an off-ladder request would be
-        // encoded as speed 0 (48 kHz) on the wire while this client kept —
-        // and announced, via sampleRateHz() — the asked-for number, putting
-        // every frequency the app derives from the rate off by that ratio.
-        // Snap to the nearest ladder entry and hold THAT as the truth.
         val ladder = Hl2Protocol.RATE_TO_SPEED.keys
-        val actual = ladder.minByOrNull { kotlin.math.abs(it - hz) } ?: 48000
-        synchronized(stateLock) { state.sampleRate = actual }
+        require(hz in ladder) { "sample rate $hz is not one of ${ladder.sorted()}" }
+        val s = requireControlSession()
+        synchronized(sendLock) {
+            check(sessionRef.get() === s && s.running && !s.socket.isClosed) {
+                "Protocol-1 control sender is not running"
+            }
+            val previous = synchronized(stateLock) { state.sampleRate.also { state.sampleRate = hz } }
+            try {
+                sendExactControlBankLocked(s, 0)
+            } catch (failure: Exception) {
+                synchronized(stateLock) { state.sampleRate = previous }
+                retireAfterControlFailure(s, "sample-rate transaction")
+                throw failure
+            }
+        }
         updateFlushThreshold()
-        sessionRef.get()?.spectrum?.resetSmoothing()
-        nudge()
+        s.spectrum.resetSmoothing()
+        lastControlChangeNs = System.nanoTime()
     }
 
     /**
@@ -860,25 +949,211 @@ class Hl2Client(
      * Range: -12 to +48 dB.
      */
     override fun setLnaGain(db: Int) {
-        synchronized(stateLock) { state.lnaGainDb = db.coerceIn(-12, 48) }
-        nudge()
+        require(db in -12..48) { "LNA gain $db dB is outside -12..48" }
+        applyExactControlState(
+            c0 = 10,
+            operation = "LNA-gain transaction",
+            mutate = { it.lnaGainDb.also { _ -> it.lnaGainDb = db } },
+            rollback = { state, previous -> state.lnaGainDb = previous },
+        )
     }
 
-    /** Configure 1 or 2 hardware receivers. */
+    /** Configure the exact requested hardware-receiver count. */
     // HL2 gateware supports up to 4 DDCs; the frame slot math (6*nRx+2,
     // 504 usable bytes) holds for all four. No artificial 2-RX cap.
-    fun setReceiverCount(n: Int) { synchronized(stateLock) { state.receiverCount = n.coerceIn(1, MAX_RECEIVERS) } }
+    fun setReceiverCount(n: Int) {
+        require(n in 1..profile.receiverCapacity) {
+            "receiver count $n is outside ${profile.displayName} capacity 1..${profile.receiverCapacity}"
+        }
+        require(activeReceiver < n) { "active receiver $activeReceiver is outside count $n" }
+        require(rxStreamMask and ((1 shl n) - 1).inv() == 0) {
+            "receiver stream mask references a removed receiver"
+        }
+        require(
+            synchronized(stateLock) {
+                state.diversityMode != DiversityMode.RX1_RX2 || n >= 2
+            },
+        ) { "RX1/RX2 diversity cannot survive receiver count $n" }
+        val s = requireControlSession()
+        synchronized(sendLock) {
+            check(sessionRef.get() === s && s.running && !s.socket.isClosed) {
+                "Protocol-1 control sender is not running"
+            }
+            val previous = synchronized(stateLock) {
+                state.receiverCount.also { state.receiverCount = n }
+            }
+            try {
+                sendExactControlBankLocked(s, 0)
+            } catch (failure: Exception) {
+                synchronized(stateLock) { state.receiverCount = previous }
+                retireAfterControlFailure(s, "receiver-count transaction")
+                throw failure
+            }
+        }
+        lastControlChangeNs = System.nanoTime()
+    }
 
     /** Set receiver 2's frequency (kept for the existing command; generalized by setRxFrequency). */
     fun setFrequency2(hz: Long) {
-        synchronized(stateLock) { state.rxFreqHz[1] = hz }
-        nudge()
+        setRxFrequency(1, hz)
     }
 
-    /** Choose which receiver (0 or 1) drives the spectrum/waterfall and audio. */
+    /** Choose which configured receiver drives the spectrum/waterfall and audio. */
     fun setActiveReceiver(index: Int) {
-        activeReceiver = index.coerceIn(0, 1)
-        sessionRef.get()?.spectrum?.resetSmoothing()
+        val count = synchronized(stateLock) { state.receiverCount }
+        require(index in 0 until count) { "receiver $index is outside configured count $count" }
+        require(rxStreamMask and (1 shl index) == 0) {
+            "active receiver $index is already an additional stream"
+        }
+        require(
+            synchronized(stateLock) {
+                state.diversityMode != DiversityMode.RX1_RX2 || index == 0
+            },
+        ) { "classic RX1/RX2 diversity requires receiver 0 as its reference" }
+        val s = requireControlSession()
+        activeReceiver = index
+        s.spectrum.resetSmoothing()
+    }
+
+    /** True only for a discovered exact classic profile with two proven ADCs. */
+    fun supportsDiversity(): Boolean = profile.diversitySupported
+
+    /** Board-specific TX-feedback routing proved by this codec. */
+    fun supportsPureSignal(): Boolean = profile.pureSignalSupported
+
+    fun diversityMode(): DiversityMode = synchronized(stateLock) { state.diversityMode }
+
+    /** Current typed physical route for one configured classic DDC. */
+    fun rxAdc(receiver: Int): RxAdc {
+        require(usesClassicCodec) { "${profile.displayName} has no classic RX-to-ADC router" }
+        val count = synchronized(stateLock) { state.receiverCount }
+        require(receiver in 0 until profile.receiverCapacity) {
+            "receiver $receiver is outside ${profile.displayName} capacity ${profile.receiverCapacity}"
+        }
+        require(receiver < count) { "receiver $receiver is not configured (count=$count)" }
+        return synchronized(stateLock) { state.rxAdc[receiver] }
+    }
+
+    /**
+     * Route one configured classic DDC to a proven physical ADC. A rejected
+     * request leaves both memory and wire state untouched.
+     */
+    fun setRxAdc(receiver: Int, adc: RxAdc) {
+        require(usesClassicCodec) { "${profile.displayName} has no classic RX-to-ADC router" }
+        require(adc.protocol1Code < profile.physicalAdcCount) {
+            "$adc is unavailable on ${profile.displayName} (${profile.physicalAdcCount} ADC)"
+        }
+        require(receiver in 0 until profile.receiverCapacity) {
+            "receiver $receiver is outside ${profile.displayName} capacity ${profile.receiverCapacity}"
+        }
+        val s = sessionRef.get()
+            ?: throw IllegalStateException("Protocol-1 control sender is not running")
+        synchronized(sendLock) {
+            check(sessionRef.get() === s && s.running && !s.socket.isClosed) {
+                "Protocol-1 control sender is not running"
+            }
+            val previous = synchronized(stateLock) {
+                require(receiver < state.receiverCount) {
+                    "receiver $receiver is not configured (count=${state.receiverCount})"
+                }
+                if (state.diversityMode == DiversityMode.RX1_RX2 && receiver < 2) {
+                    val other = 1 - receiver
+                    require(state.rxAdc[other] != adc) {
+                        "RX1/RX2 diversity requires distinct physical ADC inputs"
+                    }
+                }
+                state.rxAdc[receiver].also { state.rxAdc[receiver] = adc }
+            }
+            if (previous == adc) return
+            try {
+                sendExactControlBankLocked(s, 0x0E)
+                s.c0Index = 1 // paired RX1/RX2 NCO bank follows the route
+            } catch (failure: Exception) {
+                synchronized(stateLock) { state.rxAdc[receiver] = previous }
+                retireAfterControlFailure(s, "RX-to-ADC route transaction")
+                throw failure
+            }
+        }
+        lastControlChangeNs = System.nanoTime()
+    }
+
+    /**
+     * Apply the fixed classic phase-coherent pair as one wire transaction.
+     *
+     * Enable order is addr0x0E route -> RX1/RX2 NCO bank -> C0=0 sync bit.
+     * Disable sends C0=0 with sync clear before a caller may edit routes.
+     */
+    fun setDiversityMode(mode: DiversityMode) {
+        require(usesClassicCodec) { "${profile.displayName} has no classic diversity router" }
+        require(profile.diversitySupported || mode == DiversityMode.DISABLED) {
+            "${profile.displayName} has only ${profile.physicalAdcCount} physical ADC"
+        }
+        val s = sessionRef.get()
+            ?: throw IllegalStateException("Protocol-1 control sender is not running")
+        synchronized(sendLock) {
+            check(sessionRef.get() === s && s.running && !s.socket.isClosed) {
+                "Protocol-1 control sender is not running"
+            }
+            val previousMode: DiversityMode
+            val previousRoutes: Array<RxAdc>
+            val previousRx2Hz: Long
+            synchronized(stateLock) {
+                if (state.diversityMode == mode) return
+                if (mode == DiversityMode.RX1_RX2) {
+                    require(state.receiverCount >= 2) {
+                        "RX1/RX2 diversity needs two configured receivers"
+                    }
+                    require(activeReceiver == 0) {
+                        "RX1/RX2 diversity requires receiver 0 as reference"
+                    }
+                }
+                previousMode = state.diversityMode
+                previousRoutes = state.rxAdc.copyOf()
+                previousRx2Hz = state.rxFreqHz[1]
+                state.diversityMode = mode
+                if (mode == DiversityMode.RX1_RX2) {
+                    state.rxAdc[0] = RxAdc.ADC1
+                    state.rxAdc[1] = RxAdc.ADC2
+                    state.rxFreqHz[1] = state.rxFreqHz[0]
+                }
+            }
+            try {
+                if (mode == DiversityMode.RX1_RX2) {
+                    sendExactControlBankLocked(s, 0x0E)
+                    sendExactControlBankLocked(s, 2)
+                    sendExactControlBankLocked(s, 0)
+                    s.c0Index = 3
+                } else {
+                    sendExactControlBankLocked(s, 0)
+                    s.c0Index = 0
+                }
+            } catch (failure: Exception) {
+                synchronized(stateLock) {
+                    state.diversityMode = previousMode
+                    previousRoutes.copyInto(state.rxAdc)
+                    state.rxFreqHz[1] = previousRx2Hz
+                }
+                retireAfterControlFailure(s, "diversity transaction")
+                throw failure
+            }
+        }
+        lastControlChangeNs = System.nanoTime()
+    }
+
+    /** Exact semantic adapter for the app/driver wire command. */
+    fun setDiversity(enabled: Boolean, referenceReceiver: Int, memberMask: Int) {
+        if (enabled) {
+            require(referenceReceiver == 0 && memberMask == 0b10) {
+                "classic Protocol-1 supports only reference=0/memberMask=0b10"
+            }
+            setDiversityMode(DiversityMode.RX1_RX2)
+        } else {
+            require(memberMask == 0) { "disabled diversity must use memberMask=0" }
+            require(referenceReceiver == activeReceiver) {
+                "disabled diversity reference $referenceReceiver is not active $activeReceiver"
+            }
+            setDiversityMode(DiversityMode.DISABLED)
+        }
     }
 
     /** Bit n = also stream receiver n's IQ via the onDataRx callback. */
@@ -888,6 +1163,15 @@ class Hl2Client(
     // is about to be zeroed). The next flush drains every disarmed receiver
     // anyway, on the thread that owns those arrays.
     fun setRxStreamMask(mask: Int) {
+        val count = synchronized(stateLock) { state.receiverCount }
+        val allowed = (1 shl count) - 1
+        require(mask >= 0 && mask and allowed.inv() == 0) {
+            "receiver stream mask 0x${mask.toString(16)} exceeds 0x${allowed.toString(16)}"
+        }
+        require(mask and (1 shl activeReceiver) == 0) {
+            "receiver stream mask contains active/reference receiver $activeReceiver"
+        }
+        requireControlSession()
         rxStreamMask = mask
     }
 
@@ -904,9 +1188,17 @@ class Hl2Client(
         sessionRef.get()?.fft?.setSmoothingFactor(alpha)
     }
 
-    override fun setTxFrequency(hz: Long) {
-        synchronized(stateLock) { state.txFreqHz = hz }
-        nudge()
+    override fun setTxFrequency(hz: Long): Boolean {
+        require(hz in 10_000L..(if (usesClassicCodec) 61_400_000L else 38_400_000L)) {
+            "TX frequency $hz Hz is outside this board's exact tuning range"
+        }
+        applyExactControlState(
+            c0 = 0,
+            operation = "transmit-frequency transaction",
+            mutate = { it.txFreqHz.also { _ -> it.txFreqHz = hz } },
+            rollback = { state, previous -> state.txFreqHz = previous },
+        )
+        return true
     }
 
     // TX sequencing for a linear amp: on key-DOWN raise the amp/relay OC
@@ -916,12 +1208,28 @@ class Hl2Client(
     // and it behaves exactly as before.
     @Volatile private var ampTxDelayMs = 0
     @Volatile private var ampHangMs = 0
-    private var seqJob: Job? = null
-
     fun setAmpKey(mask: Int, txDelayMs: Int, hangMs: Int) {
-        synchronized(stateLock) { state.ampKeyMask = mask and 0x7F }
-        ampTxDelayMs = txDelayMs.coerceIn(0, 1000)
-        ampHangMs = hangMs.coerceIn(0, 1000)
+        require(mask >= 0 && mask and 0x7F.inv() == 0) {
+            "amplifier key mask 0x${mask.toString(16)} exceeds 0x7f"
+        }
+        require(txDelayMs in 0..1000) { "amplifier TX delay $txDelayMs is outside 0..1000 ms" }
+        require(hangMs in 0..1000) { "amplifier hang $hangMs is outside 0..1000 ms" }
+        applyExactControlState(
+            c0 = 0,
+            operation = "amplifier-key policy transaction",
+            mutate = {
+                Triple(it.ampKeyMask, ampTxDelayMs, ampHangMs).also { _ ->
+                    it.ampKeyMask = mask
+                    ampTxDelayMs = txDelayMs
+                    ampHangMs = hangMs
+                }
+            },
+            rollback = { state, previous ->
+                state.ampKeyMask = previous.first
+                ampTxDelayMs = previous.second
+                ampHangMs = previous.third
+            },
+        )
     }
 
     /**
@@ -934,21 +1242,47 @@ class Hl2Client(
      * stored but never sent.
      */
     override fun setTxTiming(latencyMs: Int, hangMs: Int) {
-        synchronized(stateLock) {
-            // ControlState saturates both to the register range on write.
-            state.txLatencyMs = latencyMs
-            state.pttHang = hangMs
+        require(latencyMs in 0..127) { "TX latency $latencyMs is outside 0..127 ms" }
+        require(hangMs in 0..31) { "PTT hang $hangMs is outside 0..31 ms" }
+        require(!usesClassicCodec) {
+            "${profile.displayName} has no Protocol-1 TX-buffer timing register"
         }
-        nudge()
+        applyExactControlState(
+            c0 = 0x16,
+            operation = "TX-buffer timing transaction",
+            mutate = {
+                Pair(it.txLatencyMs, it.pttHang).also { _ ->
+                    it.txLatencyMs = latencyMs
+                    it.pttHang = hangMs
+                }
+            },
+            rollback = { state, previous ->
+                state.txLatencyMs = previous.first
+                state.pttHang = previous.second
+            },
+        )
     }
 
     override fun setPtt(on: Boolean) {
-        nudge()
-        seqJob?.cancel()
+        val s = requireControlSession()
         val sequenced = (ampTxDelayMs > 0 || ampHangMs > 0) &&
             synchronized(stateLock) { state.ampKeyMask != 0 }
         if (!sequenced) {
-            synchronized(stateLock) { state.mox = on; state.ampKeyed = on }
+            applyExactControlState(
+                s = s,
+                c0 = 0,
+                operation = "PTT transaction",
+                mutate = {
+                    Pair(it.mox, it.ampKeyed).also { _ ->
+                        it.mox = on
+                        it.ampKeyed = on
+                    }
+                },
+                rollback = { state, previous ->
+                    state.mox = previous.first
+                    state.ampKeyed = previous.second
+                },
+            )
             if (!on) {
                 synchronized(txLock) { txQueue.clear() }
                 // Unkey: spectrum jumps from TX leakage back to band noise —
@@ -959,35 +1293,106 @@ class Hl2Client(
         }
         if (on) {
             // Amp/relay OC line up first; RF (mox) after the settle delay.
-            synchronized(stateLock) { state.ampKeyed = true; state.mox = false }
-            seqJob = scope.launch {
-                delay(ampTxDelayMs.toLong())
-                synchronized(stateLock) { if (state.ampKeyed) state.mox = true }
-            }
+            applyExactControlState(
+                s = s,
+                c0 = 0,
+                operation = "amplifier-key transaction",
+                mutate = {
+                    Pair(it.mox, it.ampKeyed).also { _ ->
+                        it.ampKeyed = true
+                        it.mox = false
+                    }
+                },
+                rollback = { state, previous ->
+                    state.mox = previous.first
+                    state.ampKeyed = previous.second
+                },
+            )
+            waitForSequencerDelay(s, ampTxDelayMs, "amplifier key-up")
+            applyExactControlState(
+                s = s,
+                c0 = 0,
+                operation = "PTT key-up transaction",
+                mutate = { it.mox.also { _ -> it.mox = true } },
+                rollback = { state, previous -> state.mox = previous },
+            )
         } else {
             // RF off immediately; hold the amp/relay for the hang, then drop.
-            synchronized(stateLock) { state.mox = false }
+            applyExactControlState(
+                s = s,
+                c0 = 0,
+                operation = "PTT key-down transaction",
+                mutate = { it.mox.also { _ -> it.mox = false } },
+                rollback = { state, previous -> state.mox = previous },
+            )
             synchronized(txLock) { txQueue.clear() }
-            sessionRef.get()?.spectrum?.resetSmoothing()          // same unkey smoothing restart
-            seqJob = scope.launch {
-                delay(ampHangMs.toLong())
-                synchronized(stateLock) { state.ampKeyed = false }
-            }
+            s.spectrum.resetSmoothing()
+            waitForSequencerDelay(s, ampHangMs, "amplifier hang")
+            applyExactControlState(
+                s = s,
+                c0 = 0,
+                operation = "amplifier release transaction",
+                mutate = { it.ampKeyed.also { _ -> it.ampKeyed = false } },
+                rollback = { state, previous -> state.ampKeyed = previous },
+            )
+        }
+    }
+
+    private fun waitForSequencerDelay(s: Session, delayMs: Int, operation: String) {
+        if (delayMs == 0) return
+        try {
+            Thread.sleep(delayMs.toLong())
+        } catch (failure: InterruptedException) {
+            Thread.currentThread().interrupt()
+            retireAfterControlFailure(s, operation)
+            throw IllegalStateException("$operation was interrupted before terminal write", failure)
         }
     }
 
     override fun setTxDrive(level: Int) {
-        synchronized(stateLock) { state.txDrive = level.coerceIn(0, 255) }
-        nudge()
+        require(level in 0..255) { "TX drive $level is outside 0..255" }
+        applyExactControlState(
+            c0 = 8,
+            operation = "TX-drive transaction",
+            mutate = { it.txDrive.also { _ -> it.txDrive = level } },
+            rollback = { state, previous -> state.txDrive = previous },
+        )
     }
 
-    override fun setPaEnabled(on: Boolean) { synchronized(stateLock) { state.paEnabled = on } }
+    override fun setPaEnabled(on: Boolean) {
+        require(!usesClassicCodec) {
+            "${profile.displayName} has no host-controlled PA-enable bit"
+        }
+        applyExactControlState(
+            c0 = 8,
+            operation = "PA-enable transaction",
+            mutate = { it.paEnabled.also { _ -> it.paEnabled = on } },
+            rollback = { state, previous -> state.paEnabled = previous },
+        )
+    }
 
     /** Enable VNA (antenna-analyzer) sweep mode — addr 0x09 data bit 23. */
-    fun setVnaMode(on: Boolean) { synchronized(stateLock) { state.vnaMode = on } }
+    fun setVnaMode(on: Boolean) {
+        require(!usesClassicCodec) { "${profile.displayName} has no HL2 VNA-mode bit" }
+        applyExactControlState(
+            c0 = 8,
+            operation = "VNA-mode transaction",
+            mutate = { it.vnaMode.also { _ -> it.vnaMode = on } },
+            rollback = { state, previous -> state.vnaMode = previous },
+        )
+    }
 
     /** VNA sweep point count — addr 0x09 data[15:0] (radio.v). */
-    fun setVnaCount(n: Int) { synchronized(stateLock) { state.vnaCount = n.coerceIn(0, 65535) } }
+    fun setVnaCount(n: Int) {
+        require(n in 1..65_535) { "VNA point count $n is outside 1..65535" }
+        require(!usesClassicCodec) { "${profile.displayName} has no HL2 VNA-count register" }
+        applyExactControlState(
+            c0 = 8,
+            operation = "VNA-count transaction",
+            mutate = { it.vnaCount.also { _ -> it.vnaCount = n } },
+            rollback = { state, previous -> state.vnaCount = previous },
+        )
+    }
 
     private val oneShotQueue = ArrayDeque<Pair<Int, Int>>()
 
@@ -1008,7 +1413,31 @@ class Hl2Client(
     }
 
     /** PureSignal TX-feedback routing — addr 0x0A data[22]. */
-    fun setPureSignal(on: Boolean) { synchronized(stateLock) { state.pureSignal = on } }
+    fun setPureSignal(on: Boolean) {
+        require(profile.pureSignalSupported || !on) {
+            "${profile.displayName} has no verified PureSignal feedback-DDC route"
+        }
+        require(
+            !on || synchronized(stateLock) { state.diversityMode != DiversityMode.RX1_RX2 },
+        ) { "RX2 cannot be PureSignal feedback while RX1/RX2 diversity is active" }
+        val s = requireControlSession()
+        synchronized(sendLock) {
+            check(sessionRef.get() === s && s.running && !s.socket.isClosed) {
+                "Protocol-1 control sender is not running"
+            }
+            val previous = synchronized(stateLock) {
+                state.pureSignal.also { state.pureSignal = on }
+            }
+            try {
+                sendExactControlBankLocked(s, 10)
+            } catch (failure: Exception) {
+                synchronized(stateLock) { state.pureSignal = previous }
+                retireAfterControlFailure(s, "PureSignal route transaction")
+                throw failure
+            }
+        }
+        lastControlChangeNs = System.nanoTime()
+    }
 
     // ========================================================================
     // N2ADR IO board (Pico I2C slave 0x1D on bus 2)
@@ -1039,6 +1468,10 @@ class Hl2Client(
      * REG_RF_INPUTS user setting for the external RX jack.
      */
     fun setIoBoard(enabled: Boolean, rfInput: Int, opMode: Int) {
+        require(rfInput in 0..2) { "IO-board RF input $rfInput is outside 0..2" }
+        require(opMode in setOf(-1, 0, 1, 4, 5, 6)) {
+            "IO-board operating mode $opMode is not a Thetis-compatible value"
+        }
         synchronized(ioLock) {
             // The register reset is a start-of-session action, not a
             // per-toggle one: it zeroes all 256 registers on the board,
@@ -1047,7 +1480,7 @@ class Hl2Client(
             // cycle would wipe the tuner's state mid-sequence.
             if (enabled && !ioResetDone) ioNeedsReset = true
             ioEnabled = enabled
-            ioRfInput = rfInput.coerceIn(0, 2)
+            ioRfInput = rfInput
             ioOpMode = opMode
         }
         // Disabling stops the mirror for good — maybePushIoBoard() returns
@@ -1161,20 +1594,86 @@ class Hl2Client(
         enabled: Boolean, wpm: Int, mode: Int, weight: Int,
         spacing: Boolean, reverse: Boolean, pttDelayMs: Int, hangMs: Int,
     ) {
-        synchronized(stateLock) {
+        require(wpm in 1..60) { "CW speed $wpm is outside 1..60 WPM" }
+        require(mode in 0..2) { "CW keyer mode $mode is outside 0..2" }
+        require(weight in 10..90) { "CW weight $weight is outside 10..90" }
+        require(pttDelayMs in 0..255) { "CW PTT delay $pttDelayMs is outside 0..255 ms" }
+        require(hangMs in 0..1023) { "CW hang $hangMs is outside 0..1023 ms" }
+        require(!usesClassicCodec) {
+            "${profile.displayName} has no verified HL2 CW-keyer register layout"
+        }
+        val s = requireControlSession()
+        synchronized(sendLock) {
+            check(sessionRef.get() === s && s.running && !s.socket.isClosed) {
+                "Protocol-1 control sender is not running"
+            }
+            val previous = synchronized(stateLock) {
+                CwKeyerSnapshot(
+                    state.cwKeyerEnabled,
+                    state.cwSpeedWpm,
+                    state.cwMode,
+                    state.cwWeight,
+                    state.cwSpacing,
+                    state.cwReverse,
+                    state.cwPttDelayMs,
+                    state.cwHangMs,
+                ).also {
+                    state.cwKeyerEnabled = enabled
+                    state.cwSpeedWpm = wpm
+                    state.cwMode = mode
+                    state.cwWeight = weight
+                    state.cwSpacing = spacing
+                    state.cwReverse = reverse
+                    state.cwPttDelayMs = pttDelayMs
+                    state.cwHangMs = hangMs
+                }
+            }
+            try {
+                // Settings occupy addr0B, addr0F and addr10 respectively.
+                sendExactControlBankLocked(s, 10)
+                sendExactControlBankLocked(s, 0x0E)
+                sendExactControlBankLocked(s, 0x10)
+            } catch (failure: Exception) {
+                synchronized(stateLock) { previous.restore(state) }
+                retireAfterControlFailure(s, "CW-keyer transaction")
+                throw failure
+            }
+        }
+        lastControlChangeNs = System.nanoTime()
+    }
+
+    private data class CwKeyerSnapshot(
+        val enabled: Boolean,
+        val speedWpm: Int,
+        val mode: Int,
+        val weight: Int,
+        val spacing: Boolean,
+        val reverse: Boolean,
+        val pttDelayMs: Int,
+        val hangMs: Int,
+    ) {
+        fun restore(state: Hl2Protocol.ControlState) {
             state.cwKeyerEnabled = enabled
-            state.cwSpeedWpm = wpm.coerceIn(1, 60)
-            state.cwMode = mode.coerceIn(0, 2)
-            state.cwWeight = weight.coerceIn(10, 90)
+            state.cwSpeedWpm = speedWpm
+            state.cwMode = mode
+            state.cwWeight = weight
             state.cwSpacing = spacing
             state.cwReverse = reverse
-            state.cwPttDelayMs = pttDelayMs.coerceIn(0, 255)
-            state.cwHangMs = hangMs.coerceIn(0, 1023)
+            state.cwPttDelayMs = pttDelayMs
+            state.cwHangMs = hangMs
         }
     }
 
     /** Hold the T/R relay in receive even while keyed — addr 0x09 data bit 18. */
-    fun setTrDisable(on: Boolean) { synchronized(stateLock) { state.trDisable = on } }
+    fun setTrDisable(on: Boolean) {
+        require(!usesClassicCodec) { "${profile.displayName} has no HL2 T/R-disable bit" }
+        applyExactControlState(
+            c0 = 8,
+            operation = "T/R-disable transaction",
+            mutate = { it.trDisable.also { _ -> it.trDisable = on } },
+            rollback = { state, previous -> state.trDisable = previous },
+        )
+    }
 
     /**
      * Set the 7 open-collector outputs (addr 0x00 data[23:17]). The gateware
@@ -1186,11 +1685,26 @@ class Hl2Client(
      * word while keyed — switched atomically with mox in the frame builder.
      */
     fun setOpenCollectorOutputs(mask: Int, txMask: Int = -1) {
-        synchronized(stateLock) {
-            state.ocOutputs = mask and 0x7F
-            state.ocOutputsTx = if (txMask < 0) -1 else txMask and 0x7F
+        require(mask >= 0 && mask and 0x7F.inv() == 0) {
+            "open-collector mask 0x${mask.toString(16)} exceeds 0x7f"
         }
-        nudge()
+        require(txMask == -1 || txMask >= 0 && txMask and 0x7F.inv() == 0) {
+            "TX open-collector mask 0x${txMask.toString(16)} is not -1 or a 7-bit mask"
+        }
+        applyExactControlState(
+            c0 = 0,
+            operation = "open-collector transaction",
+            mutate = {
+                Pair(it.ocOutputs, it.ocOutputsTx).also { _ ->
+                    it.ocOutputs = mask
+                    it.ocOutputsTx = txMask
+                }
+            },
+            rollback = { state, previous ->
+                state.ocOutputs = previous.first
+                state.ocOutputsTx = previous.second
+            },
+        )
     }
 
     fun getOpenCollectorOutputs(): Int = synchronized(stateLock) { state.ocOutputs }

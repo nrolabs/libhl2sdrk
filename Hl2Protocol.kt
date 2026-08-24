@@ -59,7 +59,11 @@ object Hl2Protocol {
         var txDrive = 0
         var paEnabled = false
         var mox = false
-        var receiverCount = 1            // 1 or 2 hardware receivers
+        var receiverCount = 1            // exact profile capacity, max 4 in this codec
+        /** Classic addr 0x0E C1, one typed physical ADC route per DDC. */
+        val rxAdc = Array(4) { RxAdc.ADC1 }
+        /** Classic C0=0 C4 bit7; only the fixed DDC0/DDC1 pair exists. */
+        var diversityMode = DiversityMode.DISABLED
         var vnaMode = false              // addr 0x09 data bit 23 — antenna-analyzer sweep
         var trDisable = false            // addr 0x09 data bit 18 — hold the T/R relay in RX
         var ocOutputs = 0                // addr 0x00 data[23:17] — 7 open-collector outputs (RX)
@@ -111,13 +115,18 @@ object Hl2Protocol {
         // never makes it to air. 70 ms of latency absorbs real-world network
         // jitter and 30 counts of hang keep the key up across short gaps —
         // the values recommended for remote HL2 operation.
-        // Both clamp on write instead of masking on encode: a request beyond
-        // the register range must saturate (256 -> 127), never wrap to a tiny
-        // buffer (256 masked to 7 bits = 0 ms) that drops the first syllable.
+        // Values are refused on write rather than clamped or masked: the
+        // caller must never receive APPLIED for a different timing value.
         var pttHang = 30                 // addr 0x17 C3[4:0] — PTT hang time (0..31)
-            set(v) { field = v.coerceIn(0, 31) }
+            set(v) {
+                require(v in 0..31) { "PTT hang $v is outside 0..31" }
+                field = v
+            }
         var txLatencyMs = 70             // addr 0x17 C4[6:0] — TX buffer latency in ms (0..127)
-            set(v) { field = v.coerceIn(0, 127) }
+            set(v) {
+                require(v in 0..127) { "TX latency $v is outside 0..127 ms" }
+                field = v
+            }
         var resetOnDisconnect = true     // addr 0x3A C4 bit 0 — free the board on link loss
         /**
          * Classic Protocol-1 board (Hermes/Angelia/Orion families) instead of
@@ -126,7 +135,9 @@ object Hl2Protocol {
          * the HL2-specific addr 0x09 C2 bits (VNA/PA/T-R) stay clear — the
          * classic firmware assigns that byte to other functions.
          */
-        var classicBoard = false
+        var usesClassicCodec = false
+        /** Proven by the exact discovered Protocol-1 product profile. */
+        var classicPhysicalAdcCount = 0
     }
 
     /** RX sample slot size in bytes for [nRx] receivers: I(3)+Q(3) per RX + mic(2). */
@@ -202,6 +213,41 @@ object Hl2Protocol {
         state: ControlState,
         pullTxSample: (() -> Int?)?
     ): ByteArray {
+        require(c0Index in intArrayOf(0, 2, 4, 6, 8, 10, 0x0E, 0x10, 0x16, 0x3A)) {
+            "Protocol-1 C0 bank 0x${c0Index.toString(16)} is outside the codec contract"
+        }
+        require(!state.usesClassicCodec || c0Index in intArrayOf(0, 2, 4, 6, 8, 10, 0x0E)) {
+            "classic Protocol-1 cannot serialize HL2-only bank 0x${c0Index.toString(16)}"
+        }
+        val speed = requireNotNull(RATE_TO_SPEED[state.sampleRate]) {
+            "sample rate ${state.sampleRate} is not an exact Protocol-1 rate"
+        }
+        require(state.receiverCount in 1..state.rxFreqHz.size) {
+            "receiver count ${state.receiverCount} is outside 1..${state.rxFreqHz.size}"
+        }
+        require(state.lnaGainDb in -12..48) {
+            "LNA gain ${state.lnaGainDb} dB is outside -12..48"
+        }
+        if (state.usesClassicCodec) {
+            require(state.classicPhysicalAdcCount in 1..2) {
+                "classic physical ADC count ${state.classicPhysicalAdcCount} is unproved"
+            }
+            require(state.rxAdc.take(state.receiverCount).all {
+                it.protocol1Code < state.classicPhysicalAdcCount
+            }) { "a configured classic DDC references an unavailable physical ADC" }
+        }
+        if (state.diversityMode == DiversityMode.RX1_RX2) {
+            require(state.usesClassicCodec) {
+                "Hermes-Lite 2 cannot serialize classic Protocol-1 diversity"
+            }
+            require(state.receiverCount >= 2) { "classic diversity requires RX1 and RX2" }
+            require(state.rxAdc[0] != state.rxAdc[1]) {
+                "classic diversity requires distinct physical ADC inputs"
+            }
+            require(state.rxFreqHz[0] == state.rxFreqHz[1]) {
+                "classic diversity requires frequency-locked RX1/RX2"
+            }
+        }
         val buf = ByteArray(FRAME)
         buf[0] = 0xEF.toByte(); buf[1] = 0xFE.toByte(); buf[2] = 0x01; buf[3] = 0x02
         putBE32(buf, 4, seq)
@@ -225,7 +271,7 @@ object Hl2Protocol {
         }
         when (c0Index) {
             0 -> {                                       // addr0 config + addr1 TX freq
-                buf[12] = (RATE_TO_SPEED[state.sampleRate] ?: 0).toByte()  // C1 speed
+                buf[12] = speed.toByte()  // C1 speed
                 // C2 = data[23:16]: the 7 open-collector outputs sit in data[23:17],
                 // i.e. C2[7:1]; the gateware forwards them to the filter board (I2C 0x20)
                 // for one-hot low-/high-pass filter selection. The TX word is
@@ -238,8 +284,14 @@ object Hl2Protocol {
                 // mox exactly.
                 if (state.ampKeyed) oc = oc or state.ampKeyMask
                 buf[13] = ((oc and 0x7F) shl 1).toByte()
-                // C4: duplex (bit2) + number of receivers - 1 (bits 6:3)
-                buf[15] = (0x04 or (((state.receiverCount - 1) and 0x07) shl 3)).toByte()
+                // C4: duplex (bit2) + receiver count (bits 6:3). Classic
+                // bit7 phase-locks DDC0/DDC1; HL2 must keep it clear.
+                val diversityBit = if (
+                    state.usesClassicCodec && state.diversityMode == DiversityMode.RX1_RX2
+                ) 0x80 else 0
+                buf[15] = (
+                    0x04 or (((state.receiverCount - 1) and 0x07) shl 3) or diversityBit
+                ).toByte()
                 putBE32(buf, 524, state.txFreqHz)
             }
             2 -> {                                       // addr2 RX1 freq + addr3 RX2 freq
@@ -253,7 +305,7 @@ object Hl2Protocol {
             8 -> {                                        // addr9 drive + PA/flags (C2)
                 buf[524] = state.txDrive.toByte()         // C1 = data[31:24] = TX drive
                 var c2 = 0                                 // C2 = data[23:16]
-                if (!state.classicBoard) {                 // HL2 gateware extensions only
+                if (!state.usesClassicCodec) {             // HL2 gateware extensions only
                     if (state.vnaMode) c2 = c2 or 0x80    // bit23 — VNA sweep mode
                     if (state.paEnabled) c2 = c2 or 0x08  // bit19 — PA enable
                     if (state.trDisable) c2 = c2 or 0x04  // bit18 — disable T/R relay
@@ -273,10 +325,10 @@ object Hl2Protocol {
             }
             10 -> {
                 buf[15] =
-                    if (state.classicBoard) {
+                    if (state.usesClassicCodec) {
                         // Classic step attenuator: bit5 enable + 0..31 dB. The
                         // shared −12..+48 dB gain scale maps onto attenuation.
-                        val att = ((48 - state.lnaGainDb.coerceIn(-12, 48)) * 31) / 60
+                        val att = ((48 - state.lnaGainDb) * 31) / 60
                         (0x20 or (att and 0x1F)).toByte()
                     } else {
                         (((state.lnaGainDb + 12) and 0x3F) or 0x40).toByte()  // addr0A HL2 LNA
@@ -294,9 +346,22 @@ object Hl2Protocol {
                     buf[525] = (if (state.cwReverse) 0x40 else 0).toByte()     // C2 = data[23:16]
                 }
             }
-            0x0E -> {                                    // addr0x0E (unused) + addr0x0F CW PTT delay
-                // cw_ptt_delay = data[15:8] = C3 of the second sub-frame.
-                buf[526] = (state.cwPttDelayMs and 0xFF).toByte()
+            0x0E -> {
+                if (state.usesClassicCodec) {
+                    // Classic addr0x0E C1: RX1..RX4 occupy consecutive
+                    // two-bit DDC->ADC fields. C2 (RX5..7), C3 (TX ADC
+                    // attenuation) and paired addr0x0F remain neutral until
+                    // those separate contracts exist.
+                    var routes = 0
+                    state.rxAdc.forEachIndexed { rx, adc ->
+                        routes = routes or (adc.protocol1Code shl (rx * 2))
+                    }
+                    buf[12] = routes.toByte()
+                } else {
+                    // HL2 keeps its own addr0x0F CW layout; classic routing
+                    // must never leak into this profile.
+                    buf[526] = (state.cwPttDelayMs and 0xFF).toByte()
+                }
             }
             0x10 -> {                                    // addr0x10 CW hang + addr0x11 PWM env
                 // cw_hang_time = {data[31:24], data[17:16]} (10 bits, ms):
