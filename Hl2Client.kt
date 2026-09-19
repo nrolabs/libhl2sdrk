@@ -41,6 +41,7 @@ import kotlinx.coroutines.*
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.SocketTimeoutException
+import java.util.concurrent.CountDownLatch
 
 /**
  * Full RX + TX driver for a Hermes-Lite 2 over the network.
@@ -164,6 +165,11 @@ class Hl2Client(
         @Volatile var running = false
         /** One-shot latch: the teardown of this session runs exactly once. */
         val teardownDone = java.util.concurrent.atomic.AtomicBoolean(false)
+        /** Serialises the final connect publication against teardown. */
+        val lifecycleLock = Any()
+        /** A losing disconnect does not return before the winning teardown. */
+        val teardownFinished = CountDownLatch(1)
+        @Volatile var teardownOwner: Thread? = null
         /** Written by the connect coroutine, read by a teardown running on
          *  the receive thread. Volatile is load-bearing, not decoration: a
          *  teardown that reads a stale null [txSenderThread] skips the
@@ -338,10 +344,27 @@ class Hl2Client(
                 ioResetDone = false
                 if (ioEnabled) ioNeedsReset = true
             }
-            s.running = true
-            onConnectionStatusChanged(true, "Connected")
-            startReceiving(s)
-            startTxSender(s)
+            val started = synchronized(s.lifecycleLock) {
+                if (s.teardownDone.get() || sessionRef.get() !== s) {
+                    false
+                } else {
+                    s.running = true
+                    onConnectionStatusChanged(true, "Connected")
+                    // A status callback may synchronously request disconnect.
+                    // Recheck before creating either loop in that case.
+                    if (s.teardownDone.get() || sessionRef.get() !== s) {
+                        false
+                    } else {
+                        startReceiving(s)
+                        startTxSender(s)
+                        true
+                    }
+                }
+            }
+            if (!started) {
+                cleanup(s, "Disconnected")
+                return@withContext false
+            }
             // A routing debt left by a previous session (the board was
             // disabled or the link dropped while J9 was selected) can only be
             // paid once there is a socket again. The write is queued here and
@@ -375,11 +398,11 @@ class Hl2Client(
             onConnectionStatusChanged(false, "Disconnected")
             return
         }
-        // Close the control admission gate synchronously. Teardown owns the
-        // slower wire/thread cleanup, but a command issued after disconnect()
-        // must never race through the still-published session.
+        // Close the control admission gate synchronously, then finish the
+        // session-bound teardown before returning. cleanup() detects its own
+        // loop thread and never self-joins.
         s.running = false
-        scope.launch { cleanup(s, "Disconnected") }
+        cleanup(s, "Disconnected")
     }
 
     /**
@@ -396,79 +419,103 @@ class Hl2Client(
      * connect() may be called again.
      */
     private fun cleanup(s: Session, statusMessage: String) {
-        if (!s.teardownDone.compareAndSet(false, true)) return
-        s.running = false
+        if (!s.teardownDone.compareAndSet(false, true)) {
+            awaitCleanupOwner(s)
+            return
+        }
         val self = Thread.currentThread()
-        // Stop the EP2 pacer BEFORE anything else is put on the wire. It is
-        // the only other writer of this socket, and it builds its frames from
-        // the same txSeq/C0 cursor: with it still running, the unkey frames
-        // below would interleave with its own and the board would see the EP2
-        // sequence go backwards on the last frames of the session.
-        s.txSenderThread?.takeIf { it !== self }?.let { DspThread.stop(it) }
+        s.teardownOwner = self
+        try {
+            synchronized(s.lifecycleLock) {
+                s.running = false
+                // Stop the EP2 pacer BEFORE anything else is put on the wire.
+                // It is the only other writer of this socket, and it builds
+                // frames from the same txSeq/C0 cursor.
+                s.txSenderThread?.takeIf { it !== self }?.let { DspThread.stop(it) }
 
-        // Shared state belongs to whichever session is published. A teardown
-        // that arrives after a newer connect() must not clear ITS keying, and
-        // must not tell the board to stop streaming to it either — so on a
-        // stale teardown the wire work is skipped and only this session's own
-        // resources are released.
-        if (sessionRef.get() === s) {
-            // Unkey ON THE WIRE, socket still open and pacer already stopped.
-            // setPtt only flips state.mox in memory and relies on the pacer's
-            // next frame; on any exit the pacer may never emit it, leaving
-            // the board holding the MOX=1 of the last frame it received. This
-            // is the one place that closes that window, for every exit path —
-            // operator disconnect mid-over as well as timeout/error — which
-            // is why the keying state is cleared HERE and not by the callers:
-            // clearing it earlier would make these frames redundant on the
-            // clean path and leave the real unkey to the failure path alone.
-            // Best-effort: on the failure paths the link may already be dead
-            // and the sends throw. The gateware's own TX watchdog remains the
-            // final protection — this only keeps it from ever being needed.
-            val wasKeyed = synchronized(stateLock) {
-                val keyed = state.mox || state.ampKeyed
-                state.mox = false; state.ampKeyed = false
-                keyed
-            }
-            if (wasKeyed) repeat(3) { runCatching { sendControlFrame(s) } }
-            // Hand the RX routing back to the internal input while the socket
-            // is still open. The board latches the J9 routing pins until a
-            // REG_RF_INPUTS = 0 write arrives, so a session that just ends
-            // with mode 1 or 2 selected leaves the main antenna dead.
-            if (ioNeutralOwed()) {
-                runCatching {
-                    i2cWrite(
-                        bus2 = true, device = IoBoard.ADDRESS,
-                        reg = IoBoard.REG_RF_INPUTS, value = 0,
-                    )
-                    // The pacer is already stopped and a control frame carries
-                    // at most one register write, so nothing else will flush
-                    // the queue this write went into: pump frames here until
-                    // it is empty. Bounded, so a queue that keeps refilling
-                    // cannot hold the teardown open.
-                    var frames = 0
-                    while (frames++ < IO_NEUTRAL_FLUSH_FRAMES && ioWritePending()) sendControlFrame(s)
-                    // The board never acknowledges a passthrough write, and an
-                    // abrupt link loss (radio unplugged, Wi-Fi gone) takes the
-                    // send with it. On that path the debt stays recorded and
-                    // is paid at the next connect; until then the board keeps
-                    // the routing it was left with. There is no way around it
-                    // from the host side.
-                    synchronized(ioLock) { ioNeutralPending = ioWritePending() }
+                // Shared state belongs to whichever session is published. A
+                // stale teardown only releases this session's own resources.
+                if (sessionRef.get() === s) {
+                    // Unkey ON THE WIRE, socket still open and pacer already stopped.
+                    // setPtt only flips state.mox in memory and relies on the pacer's
+                    // next frame; on any exit the pacer may never emit it, leaving
+                    // the board holding the MOX=1 of the last frame it received. This
+                    // is the one place that closes that window, for every exit path —
+                    // operator disconnect mid-over as well as timeout/error — which
+                    // is why the keying state is cleared HERE and not by the callers:
+                    // clearing it earlier would make these frames redundant on the
+                    // clean path and leave the real unkey to the failure path alone.
+                    // Best-effort: on the failure paths the link may already be dead
+                    // and the sends throw. The gateware's own TX watchdog remains the
+                    // final protection — this only keeps it from ever being needed.
+                    val wasKeyed = synchronized(stateLock) {
+                        val keyed = state.mox || state.ampKeyed
+                        state.mox = false; state.ampKeyed = false
+                        keyed
+                    }
+                    if (wasKeyed) repeat(3) { runCatching { sendControlFrame(s) } }
+                    // Hand the RX routing back to the internal input while the socket
+                    // is still open. The board latches the J9 routing pins until a
+                    // REG_RF_INPUTS = 0 write arrives, so a session that just ends
+                    // with mode 1 or 2 selected leaves the main antenna dead.
+                    if (ioNeutralOwed()) {
+                        runCatching {
+                            i2cWrite(
+                                bus2 = true, device = IoBoard.ADDRESS,
+                                reg = IoBoard.REG_RF_INPUTS, value = 0,
+                            )
+                            // The pacer is already stopped and a control frame carries
+                            // at most one register write, so nothing else will flush
+                            // the queue this write went into: pump frames here until
+                            // it is empty. Bounded, so a queue that keeps refilling
+                            // cannot hold the teardown open.
+                            var frames = 0
+                            while (frames++ < IO_NEUTRAL_FLUSH_FRAMES && ioWritePending()) sendControlFrame(s)
+                            // The board never acknowledges a passthrough write, and an
+                            // abrupt link loss (radio unplugged, Wi-Fi gone) takes the
+                            // send with it. On that path the debt stays recorded and
+                            // is paid at the next connect; until then the board keeps
+                            // the routing it was left with. There is no way around it
+                            // from the host side.
+                            synchronized(ioLock) { ioNeutralPending = ioWritePending() }
+                        }
+                    }
+                    runCatching { sendStartStop(s, false) }
+                }
+                // Close before joining RX: DatagramSocket.receive is not
+                // interruptible without the close.
+                s.socket.close()
+                s.receiveThread?.takeIf { it !== self }?.let { DspThread.stop(it) }
+                s.receiveThread = null
+                s.txSenderThread = null
+                s.spectrum.stop()
+                if (sessionRef.compareAndSet(s, null)) {
+                    onConnectionStatusChanged(false, statusMessage)
                 }
             }
-            runCatching { sendStartStop(s, false) }
+        } finally {
+            s.teardownOwner = null
+            s.teardownFinished.countDown()
         }
-        // Close the socket before joining the receive loop: it is what
-        // unblocks it, parked in DatagramSocket.receive and not interruptible
-        // out of it.
-        s.socket.close()
-        s.receiveThread?.takeIf { it !== self }?.let { DspThread.stop(it) }
-        s.receiveThread = null
-        s.txSenderThread = null
-        s.spectrum.stop()
-        // Only the teardown of the published session unpublishes it and
-        // reports the status; a stale one has nothing left to say.
-        if (sessionRef.compareAndSet(s, null)) onConnectionStatusChanged(false, statusMessage)
+    }
+
+    /** Wait for a concurrent owner, except on a loop it is currently joining. */
+    private fun awaitCleanupOwner(s: Session) {
+        val self = Thread.currentThread()
+        if (
+            s.teardownOwner === self ||
+            s.receiveThread === self ||
+            s.txSenderThread === self
+        ) return
+        var interrupted = false
+        while (s.teardownFinished.count != 0L) {
+            try {
+                s.teardownFinished.await()
+            } catch (_: InterruptedException) {
+                interrupted = true
+            }
+        }
+        if (interrupted) self.interrupt()
     }
 
     // ========================================================================
